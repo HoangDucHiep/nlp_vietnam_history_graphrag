@@ -19,12 +19,15 @@ import logging
 import math
 import os
 import random
+import re
 import time
 from pathlib import Path
 from typing import Any
 
 from ..data.records import stable_hash
 from .schemas import LLMMessage, LLMRequest, LLMResponse
+
+_YEAR_RE = re.compile(r"\b(9\d{2}|1[0-9]{3})\b")
 
 logger = logging.getLogger(__name__)
 
@@ -352,13 +355,24 @@ class MockLLMClient(LLMClient):
 
     @staticmethod
     def _mock_query_understanding(prompt: str) -> dict[str, Any]:
-        q = prompt.strip().splitlines()[-1][:200]
+        question = ""
+        for line in prompt.splitlines():
+            if line.strip().upper().startswith("CÂU HỎI:"):
+                question = line.split(":", 1)[1].strip()
+        entities = [
+            w
+            for w in question.replace("?", " ")
+            .replace(",", " ")
+            .split()
+            if len(w) > 2 and w[:1].isupper()
+        ]
+        years = [int(y) for y in _YEAR_RE.findall(question)]
         return {
             "intent": "factual",
-            "entities": [w for w in q.split() if len(w) > 3][:3],
-            "time_refs": [],
+            "entities": entities[:4] or ["Trần Hưng Đạo"],
+            "time_refs": years,
             "relation_plan": [],
-            "expected_hops": 1,
+            "expected_hops": 1 if len(entities) <= 1 else 2,
             "needs_graph": True,
         }
 

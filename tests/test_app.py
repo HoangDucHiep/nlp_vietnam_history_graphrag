@@ -318,7 +318,9 @@ class TestQAService:
         real_import = builtins.__import__
 
         def _fake_import(name, *args, **kwargs):
-            if name == "hgrag.qa.pipeline" or name.endswith("hgrag.qa.pipeline"):
+            if name in ("hgrag.qa", "hgrag.qa.pipeline") or name.endswith(
+                "hgrag.qa.pipeline"
+            ):
                 raise ImportError("No module named 'hgrag.qa.pipeline'")
             return real_import(name, *args, **kwargs)
 
