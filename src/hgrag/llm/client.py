@@ -34,6 +34,33 @@ logger = logging.getLogger(__name__)
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """The wait time suggested by the API in ``RetryInfo`` (if any)."""
+    payload = getattr(exc, "response", None)
+    text = str(exc)
+    match = re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s", text)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+    details = getattr(payload, "json", None)
+    if callable(details):
+        try:
+            data = details()
+        except Exception:  # noqa: BLE001
+            return None
+        for violation in (data.get("details") or []):
+            for info in violation.get("retryInfo") or []:
+                delay = info.get("retryDelay")
+                if isinstance(delay, str) and delay.endswith("s"):
+                    try:
+                        return float(delay[:-1])
+                    except ValueError:
+                        continue
+    return None
+
+
 class LLMError(RuntimeError):
     """Raised when a request fails in a non-retryable way."""
 
@@ -128,6 +155,9 @@ class GeminiClient(LLMClient):
         cache_enabled: bool = True,
         output_dim: int | None = None,
         fallback_models: list[str] | None = None,
+        embed_batch_size: int = 16,
+        embed_max_retries: int = 8,
+        max_rate_limit_wait: float = 90.0,
     ):
         try:
             from google import genai  # type: ignore
@@ -150,6 +180,9 @@ class GeminiClient(LLMClient):
         # Flash models).  When a model is exhausted we transparently rotate to
         # the next one instead of failing the whole pipeline.
         self.fallback_models = [m for m in (fallback_models or []) if m and m != model]
+        self.embed_batch_size = max(1, int(embed_batch_size))
+        self.embed_max_retries = max(1, int(embed_max_retries))
+        self.max_rate_limit_wait = float(max_rate_limit_wait)
         self._client = genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
         self._embed_dim = output_dim or 768
 
@@ -240,8 +273,18 @@ class GeminiClient(LLMClient):
                     )
                     code = int(status) if isinstance(status, int) else None
                     if code == 429:
-                        # Free-tier daily quota for this model is exhausted ->
-                        # rotate to the next model instead of burning retries.
+                        # Free tier: quota theo *phút* (hoặc theo ngày).  Nếu API
+                        # gợi ý thời gian chờ thì tôn trọng nó; nếu hết hẳn quota
+                        # ngày thì chuyển sang model dự phòng.
+                        wait = _retry_after_seconds(exc)
+                        if wait is not None and wait <= self.max_rate_limit_wait:
+                            logger.warning(
+                                "Gemini bị giới hạn tốc độ (model=%s) -- chờ %.1fs rồi thử lại",
+                                model_name,
+                                wait,
+                            )
+                            time.sleep(wait)
+                            continue
                         logger.warning(
                             "Gemini quota hết cho model %s -> chuyển model khác", model_name
                         )
@@ -263,22 +306,58 @@ class GeminiClient(LLMClient):
         raise LLMError(f"Gemini call thất bại sau khi thử {models_to_try}: {last_error}")
 
     def embed(self, texts: list[str]) -> list[list[float]]:
+        """Embed ``texts`` (batched), retrying on rate-limit errors.
+
+        The free tier of ``gemini-embedding-001`` allows a limited number of
+        embed requests *per minute*; the method therefore backs off and
+        retries instead of failing the whole run.
+        """
         if not texts:
             return []
         out: list[list[float]] = []
-        for i in range(0, len(texts), 64):
-            batch = texts[i : i + 64]
-            kwargs: dict[str, Any] = {"model": self.embed_model, "contents": batch}
-            if self.output_dim:
-                kwargs["config"] = {"output_dimensionality": self.output_dim}
-            resp = self._client.models.embed_content(**kwargs)
-            for item in resp.embeddings:
-                vec = list(item.values)
-                norm = math.sqrt(sum(x * x for x in vec)) or 1.0
-                out.append([x / norm for x in vec])
+        for i in range(0, len(texts), self.embed_batch_size):
+            batch = texts[i : i + self.embed_batch_size]
+            vectors = self._embed_batch(batch)
+            out.extend(vectors)
         if out:
             self._embed_dim = len(out[0])
         return out
+
+    def _embed_batch(self, batch: list[str]) -> list[list[float]]:
+        """Embed one batch, retrying with the delay suggested by the API.
+
+        The free tier of ``gemini-embedding-001`` limits the number of embed
+        *tokens* per minute (30 000).  When the limit is hit the API returns a
+        ``RetryInfo`` telling how long to wait -- we honour it instead of
+        failing the whole run.
+        """
+        last_error: Exception | None = None
+        for attempt in range(self.embed_max_retries):
+            try:
+                kwargs: dict[str, Any] = {"model": self.embed_model, "contents": batch}
+                if self.output_dim:
+                    kwargs["config"] = {"output_dimensionality": self.output_dim}
+                resp = self._client.models.embed_content(**kwargs)
+                vectors: list[list[float]] = []
+                for item in resp.embeddings:
+                    vec = list(item.values)
+                    norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+                    vectors.append([x / norm for x in vec])
+                return vectors
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                delay = _retry_after_seconds(exc) or (self.retry_base_delay * (2**attempt))
+                logger.warning(
+                    "Embed call failed (attempt %d/%d): %s -- retry sau %.1fs",
+                    attempt + 1,
+                    self.embed_max_retries,
+                    str(exc)[:160],
+                    delay,
+                )
+                time.sleep(delay)
+        raise LLMError(
+            f"Embed call thất bại sau {self.embed_max_retries} lần thử: {last_error}"
+        )
 
     @property
     def embed_dim(self) -> int:

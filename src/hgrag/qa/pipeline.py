@@ -120,6 +120,7 @@ class QAPipeline:
         )
         self._answer_generator: AnswerGenerator | None = None
         self._explainer: Explainer | None = None
+        self._understanding_cache: dict[str, QueryUnderstanding] = {}
 
     # ------------------------------------------------------------------
     # public API
@@ -197,8 +198,16 @@ class QAPipeline:
     # stages
     # ------------------------------------------------------------------
     def _understand(self, question: str) -> QueryUnderstanding:
+        """Understand ``question`` (cached: the plan only depends on the text)."""
+        cached = self._understanding_cache.get(question)
+        if cached is not None:
+            return cached
         module = QueryUnderstandingModule(self.llm_client)
-        return module.understand(question)
+        understanding = module.understand(question)
+        if len(self._understanding_cache) >= 512:
+            self._understanding_cache.clear()
+        self._understanding_cache[question] = understanding
+        return understanding
 
     def _flag(self, flags: Mapping[str, bool], name: str) -> bool:
         """Read an ablation flag, defaulting to ``False``."""

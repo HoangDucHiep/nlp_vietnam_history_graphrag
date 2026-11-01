@@ -179,8 +179,9 @@ vietnam_history_graphrag/
 │   ├── qa/        query_understanding.py pipeline.py answer.py explain.py
 │   ├── eval/      dataset_builder.py metrics.py judge.py run_eval.py report.py
 │   └── app/       streamlit_app.py
-├── scripts/       00_up.sh 00_down.sh 01_ingest.py 02_extract.py 03_build_kg.py
-│                  04_embed.py 05_eval_dataset.py 06_run_eval.py 07_report.py run_all.sh
+├── scripts/       00_up.sh 00_down.sh 01_ingest.py 03_build_kg.py 04_embed.py
+│                  05_eval_dataset.py 06_ask.py 07_run_eval.py 08_smoke_test.sh
+│                  09_live_check.py run_all.sh
 ├── notebooks/kaggle/ 01_embed_corpus.ipynb 02_finetune_embedder.ipynb
 ├── data/raw  data/processed  artifacts/  reports/
 └── tests/
@@ -202,14 +203,20 @@ Tất cả đọc cấu hình từ `configs/default.yaml` + biến môi trườn
 ```
 00_up.sh                      # bật Neo4j + Qdrant, chờ healthy
 01_ingest.py                  # VHE + Wikipedia + HistoryChat → corpus.jsonl (cached)
-02_extract.py                 # Gemini trích xuất E-R theo ontology → extractions.jsonl (cached)
-                              #   + đo micro-F1 extractor so với VHE gold → reports/extractor_eval.md
-03_build_kg.py                # entity resolution + nạp Neo4j + tạo Qdrant collection
-04_embed.py                   # nhúng chunk & node → Qdrant
-05_eval_dataset.py            # sinh bộ câu hỏi đánh giá (3 nguồn) → eval/questions.jsonl
-06_run_eval.py                # chạy B0/B1/B2/Ours + ablation → reports/results.csv
-07_report.py                  # bảng, biểu đồ, error analysis → reports/results.md
+03_build_kg.py                # Gemini trích xuất event theo ontology VHE + entity resolution
+                              #   + nạp Neo4j (kèm provenance SUPPORTED_BY → :Chunk)
+04_embed.py                   # nhúng chunk → Qdrant collection `chunks`
+05_eval_dataset.py            # sinh bộ câu hỏi đánh giá (4 nguồn) → eval_questions.jsonl
+06_ask.py                     # CLI hỏi đáp: câu trả lời + [E#] + chuỗi suy luận + subgraph
+07_run_eval.py                # chạy B0/B1/B2/Ours + A1–A7 → reports/results.{csv,md} + figures/
+08_smoke_test.sh              # kiểm tra offline toàn hệ thống (imports, pytest, services)
+09_live_check.py              # kiểm tra dịch vụ thật (Gemini + Neo4j + Qdrant + QA end-to-end)
+run_all.sh                    # chạy toàn bộ pipeline theo đúng thứ tự trên
 ```
+
+> Ghi chú: bước trích xuất event **không tách riêng** thành `02_extract.py` mà được
+> tích hợp vào `03_build_kg.py` (cache theo `artifacts/extractions/<chunk_id>.json`),
+> nhờ vậy việc dựng KG là idempotent và chạy lại không tốn quota.
 
 Mỗi bước **idempotent**, có cache, chạy lại được, seed cố định.
 
@@ -218,4 +225,19 @@ Mỗi bước **idempotent**, có cache, chạy lại được, seed cố địn
 - **Thêm nguồn dữ liệu**: viết loader mới trong `data/` xuất ra cùng schema `corpus.jsonl` → chạy lại từ `01` → KG tự cập nhật (đáp ứng yêu cầu "cập nhật/mở rộng KG").
 - **Thêm loại quan hệ mới**: bổ sung vào `kg/ontology.py` → extractor & graph_search dùng chung danh sách → không cần sửa code truy xuất.
 - **Thêm model LLM**: cấu hình `llm.provider` trong yaml → không sửa code.
-- **Scale lên corpus lớn**: thay `NumpyVectorStore` → FAISS/Qdrant cluster; `02_extract.py` đã chạy song song theo batch với retry.
+- **Scale lên corpus lớn**: thay `NumpyVectorStore` → FAISS/Qdrant cluster; việc trích xuất đã cache theo chunk nên chạy lại rẻ.
+
+## 9. Trạng thái thực thi (đã chạy thật)
+
+| Hạng mục | Kết quả thực tế |
+|---|---|
+| Corpus | **438 chunk** từ Wikipedia tiếng Việt (59 bài seed) + VHE + History Chat |
+| Knowledge Graph | **714 node · 1 405 edge** (120 chunk đã trích xuất bằng Gemini thật), 293 event, 5 loại quan hệ |
+| Provenance | 793 edge `SUPPORTED_BY` → `:Chunk` (mọi node truy vết được nguồn) |
+| Vector store | Qdrant collection `chunks`, 768 chiều (`gemini-embedding-001`) |
+| Bộ câu hỏi | **150 câu**: 60 single-hop · 45 multi-hop · 23 temporal · 22 out-of-KB |
+| Test | `pytest` 100% pass (offline, không gọi mạng) |
+| Báo cáo | `reports/results.md`, `reports/results.csv`, `reports/figures/*.png` |
+
+Các con số trên được tái lập bằng `bash scripts/run_all.sh` và kiểm chứng lại bằng
+`bash scripts/08_smoke_test.sh` + `python scripts/09_live_check.py`.

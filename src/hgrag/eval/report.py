@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from . import metrics as M
+from .error_analysis import write_error_analysis
 from .run_eval import ABLATIONS, EvalRun, compare_systems, summarize_run
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ __all__ = [
     "write_results_markdown",
     "make_figures",
     "build_report",
+    "write_error_analysis",
 ]
 
 #: Columns of ``reports/results.csv``.
@@ -419,9 +421,11 @@ def build_report(
     csv_path = write_results_csv(run, reports / "results.csv")
     md_path = write_results_markdown(run, reports / "results.md", comparisons)
     figures = make_figures(run, reports / "figures")
+    error_path = write_error_analysis(run, reports / "error_analysis.md")
     return {
         "results_csv": str(csv_path),
         "results_md": str(md_path),
+        "error_analysis": str(error_path),
         "figures": [str(f) for f in figures],
     }
 
