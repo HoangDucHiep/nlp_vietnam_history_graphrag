@@ -1,0 +1,89 @@
+# Configuration for the Vietnamese History GraphRAG system.
+# Every value can be overridden by an environment variable (see config.py).
+
+paths:
+  data_raw: data/raw
+  data_processed: data/processed
+  artifacts: artifacts
+  reports: reports
+  cache: artifacts/llm_cache
+
+llm:
+  provider: auto            # auto | gemini | openai | mock
+  model: gemini-3.5-flash
+  embed_model: gemini-embedding-001
+  temperature: 0.0
+  max_output_tokens: 2048
+  request_timeout: 120
+  max_retries: 4
+  retry_base_delay: 2.0
+  cache_enabled: true
+  openai_base_url: ""       # for OpenAI-compatible endpoints (vLLM on Kaggle)
+  openai_model: ""
+
+embedding:
+  provider: auto            # auto | gemini | local | mock
+  dim: 768
+  batch_size: 64
+  local_model: Qwen/Qwen3-Embedding-0.6B
+
+neo4j:
+  uri: bolt://localhost:7687
+  http_uri: http://localhost:7474
+  user: neo4j
+  password_env: NEO4J_PASSWORD
+  default_password: history2025
+  database: neo4j
+  batch_size: 500
+
+qdrant:
+  url: http://localhost:6333
+  collection_chunks: chunks
+  collection_nodes: nodes
+  vector_size: 768
+  distance: Cosine
+
+ingest:
+  wikipedia_seed_limit: 40
+  wikipedia_expand_rounds: 1
+  wikipedia_max_articles: 300
+  wikipedia_min_chars: 400
+  wikipedia_max_chars: 120000
+  history_chat_limit: 15000
+  history_chat_max_year: 1975
+  history_chat_min_year: 905
+  request_delay: 0.5
+  user_agent: "VietnamHistoryGraphRAG/0.1 (research; course project)"
+
+chunking:
+  max_chars: 1400
+  overlap_chars: 200
+  min_chars: 120
+
+extraction:
+  max_chunks: 600
+  max_events_per_chunk: 4
+
+retrieval:
+  vector_top_k: 30
+  rerank_top_k: 10
+  graph_max_hops: 3
+  graph_max_paths: 20
+  graph_max_paths_per_hop: 30
+  rrf_k: 60
+  context_max_tokens: 6000
+  max_evidence: 12
+  max_evidence_per_doc: 3
+  temporal_boost: 0.15
+  entity_link_min_confidence: 0.7
+  alias_confidence: 0.95
+  redirect_confidence: 0.9
+  normalized_confidence: 0.85
+  embedding_link_min_score: 0.86
+
+evaluation:
+  eval_size_target: 150
+  eval_exclusive_doc_ratio: 0.15
+  bootstrap_samples: 2000
+  bootstrap_ci: 0.95
+  seed: 42

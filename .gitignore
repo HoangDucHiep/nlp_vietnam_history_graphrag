@@ -1,0 +1,36 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# secrets
+.env
+.env.local
+*.key
+
+# data (reproducible via scripts/01_ingest.py)
+data/raw/
+data/processed/
+artifacts/
+*.npy
+*.npz
+*.sqlite
+*.db
+
+# reports generated
+reports/figures/*.png
+reports/results.csv
+
+# notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# misc
+.DS_Store
+*.log
+.vscode/
+.idea/

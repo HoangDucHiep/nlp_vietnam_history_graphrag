@@ -1,0 +1,192 @@
+# 05 — Kế hoạch thực hiện
+
+## 1. Tổng quan lộ trình
+
+```mermaid
+gantt
+  dateFormat YYYY-MM-DD
+  axisFormat %d/%m
+  title Lộ trình 2 ngày làm việc
+  section Nền tảng
+  Scaffold + Docker + LLM client      :d1, 00, 1.5h
+  section Dữ liệu
+  Ingest VHE + Wikipedia + Chat       :d1, 01, 3h
+  Trích xuất E-R (Gemini)             :d1, 02, 3h
+  section Đồ thị
+  Entity resolution + nạp Neo4j       :d1, 03, 3h
+  Embedding + nạp Qdrant              :d1, 04, 2h
+  section Hỏi đáp
+  Pipeline QA end-to-end              :d2, 05, 4h
+  section Đánh giá
+  Bộ câu hỏi + duyệt tay              :d2, 06, 2h
+  Metrics + chạy baseline + ablation  :d2, 07, 3h
+  section Hoàn thiện
+  UI + README + skeleton báo cáo       :d2, 08, 2h
+  section Kaggle (song song)
+  N1 batch embed                       :d2, k1, 1h
+  N2 LoRA fine-tune embedder           :d2, k2, 2h
+```
+
+## 2. Chi tiết từng bước
+
+### Bước 0 — Nền tảng (1.5 h)
+
+**Việc:**
+- `uv init` + `pyproject.toml` + `uv sync`
+- `docker-compose.yml` + `scripts/00_up.sh` (kiểm tra healthy) + `00_down.sh`
+- `configs/default.yaml` (mọi tham số)
+- `src/hgrag/llm/client.py`: `GeminiClient` (structured output, retry, cache đĩa theo hash), `MockClient`
+- `.env.example`
+
+**Cổng kiểm soát:** `docker ps` → neo4j & qdrant healthy; `python -c "from hgrag.llm import GeminiClient"` OK; một lời gọi Gemini thật trả lời.
+
+**Cắt được:** không — đây là nền.
+
+---
+
+### Bước 1 — Ingest dữ liệu (3 h)
+
+**Việc:**
+- `data/vhe.py`: tải 4 file VHE về `data/raw/vhe/` (cache, checksum) → parse ra (a) gold event để chấm extractor, (b) gold relation để sinh câu hỏi.
+- `data/wikipedia.py`: seed list (triều đại, sự kiện lớn) → `api.php` lấy nội dung theo `prop=extracts|revisions` → mở rộng bằng `prop=links` 1–2 vòng → lọc phạm vi & độ dài → tách theo mục (`section`).
+- `data/history_chat.py`: tải 15k từ HF → lấy cặp user/final → lọc phạm vi năm.
+- `data/chunking.py`: chunk theo mục, ≤ 800 token, overlap 1 câu, giữ metadata.
+- `data/normalize.py`: bỏ dấu, bỏ honorific, key chuẩn hóa.
+
+**Cổng kiểm soát:** `data/processed/corpus.jsonl` có ≥ 3.000 chunk; in stats (số doc, chunk, phân bố năm, top bài); **đọc tay 20 bài** để xác nhận không lẫn nội dung phi lịch sử.
+
+**Rủi ro:** crawler chậm → chạy nền, song song 4 luồng, có cache để chạy lại.
+
+---
+
+### Bước 2 — Ontology + trích xuất E-R (3 h)
+
+**Việc:**
+- `kg/ontology.py`: nạp 35 event type + 11 role + 3 nhóm quan hệ từ VHE.
+- `llm/prompts.py` + `llm/schemas.py`: prompt trích xuất có ràng buộc ontology, JSON schema cứng.
+- `scripts/02_extract.py`: chạy trên từng chunk, cache theo hash, retry backoff, ghi `extractions.jsonl`.
+- **Đánh giá extractor**: chạy extractor trên tập VHE (691 câu có quan hệ + vài trăm câu event) → micro-F1 cho event type và argument role → `reports/extractor_eval.md`.
+
+**Cổng kiểm soát:** F1 ≥ 0.60 (micro, event type). Nếu < 0.5 → cải thiện prompt/ontology trước khi đi tiếp (đây là con số dùng trong báo cáo).
+
+**Tối ưu:** chỉ trích xuất trên chunk có nội dung "sự kiện" (lọc trước bằng keyword lịch sử) để tiết kiệm quota Gemini.
+
+---
+
+### Bước 3 — Entity resolution + KG (3 h)
+
+**Việc:**
+- `kg/resolver.py`: 4 bước (key chuẩn hóa → union-find → cụm embedding → LLM merge có ngưỡng).
+- `kg/builder.py`: dựng node/edge theo schema §3 tài liệu 02, gắn `SUPPORTED_BY` chunk, gắn `year`.
+- `kg/store.py`: `Neo4jGraphStore` (MERGE idempotent) + `SQLiteGraphStore` fallback.
+- `scripts/03_build_kg.py`: nạp vào Neo4j, xuất `kg_stats.md`.
+
+**Cổng kiểm soát:** ≥5.000 node, ≥15.000 edge; **kiểm tra bằng mắt** 3 chuỗi quan hệ (vd: Trần Hưng Đạo → trận Bạch Đằng 1288 → Nguyễn Hữu Cảnh); truy vết được edge → chunk nguồn.
+
+---
+
+### Bước 4 — Embedding + vector store (2 h)
+
+**Việc:**
+- `retrieval/embeddings.py`: `GeminiEmbedder` + `LocalEmbedder` (HF sentence-transformers).
+- `retrieval/vector_store.py`: `QdrantVectorStore` (collection `chunks` + `nodes`, payload `year`, `type`, `doc_id`) + `NumpyVectorStore`.
+- `scripts/04_embed.py`: nhúng chunk & node → Qdrant upsert.
+- Kaggle **N1** (nếu kịp): embed toàn bộ corpus bằng Qwen3-Embedding-0.6B trên T4 → tải `.npy` về → nạp vào Qdrant để so sánh 2 backend.
+
+**Cổng kiểm soát:** số vector trong Qdrant khớp số chunk; **sanity check**: với 10 câu hỏi mẫu có đáp án nằm trong 1 chunk rõ ràng → chunk đúng phải nằm trong top-10.
+
+---
+
+### Bước 5 — Pipeline QA (4 h)
+
+**Việc:**
+- `qa/query_understanding.py` (Gemini + fallback regex).
+- `retrieval/entity_linker.py` (3 tầng).
+- `retrieval/graph_search.py` (Cypher path + scoring).
+- `retrieval/fusion.py` (RRF + temporal boost + diversity).
+- `retrieval/context.py` (ngân sách token).
+- `qa/answer.py` (prompt ràng buộc + post-check citation) + `qa/explain.py` (subgraph).
+- `qa/pipeline.py`: `answer_question(q) -> {answer, citations, reasoning_chain, subgraph, evidence, timings}`.
+
+**Cổng kiểm soát:** chạy 10 câu mẫu → mỗi câu có citation hợp lệ, subgraph vẽ được; 1 câu out-of-scope bị từ chối đúng.
+
+---
+
+### Bước 6 — Bộ câu hỏi đánh giá (2 h)
+
+**Việc:**
+- `eval/dataset_builder.py`: 4 nguồn (A/B/C/D) như tài liệu 04.
+- `app/streamlit_app.py` — tab "Duyệt câu hỏi": duyệt/sửa/bỏ, lưu `verified`.
+
+**Cổng kiểm soát:** ≥150 câu `verified=true`.
+
+**Việc của bạn:** duyệt ~20–30 câu (~20–30 phút) → ghi "đã duyệt thủ công" vào báo cáo.
+
+---
+
+### Bước 7 — Đánh giá & báo cáo (3 h)
+
+**Việc:**
+- `eval/metrics.py` (token-F1, ROUGE-L, recall@k, nDCG, path hit), `eval/judge.py` (Gemini judge: đúng/grounded/citation precision).
+- `eval/run_eval.py`: chạy B0/B1/B2/Ours + A1–A7 → `reports/results.csv`.
+- `eval/report.py`: bảng markdown, biểu đồ matplotlib, error analysis tự động + mẫu tay 30 câu.
+
+**Cổng kiểm soát:** `reports/results.md` có đủ bảng §5 tài liệu 04; có CI và McNemar.
+
+---
+
+### Bước 8 — UI + tài liệu (2 h)
+
+- Streamlit: tab Chat (có citation click → xem đoạn nguồn), tab Đồ thị (pyvis/plotly vẽ subgraph), tab So sánh (Ours vs B1), tab Đánh giá (bảng + biểu đồ), tab Duyệt câu hỏi.
+- `README.md`: cài đặt, chạy, cấu trúc, ảnh chụp màn hình.
+- `reports/report_skeleton.md` + `reports/slides_outline.md`: khung báo cáo & slide, điền số liệu sau.
+
+---
+
+### Bước 9–10 — Kaggle + báo cáo (song song)
+
+- **N2 LoRA fine-tune**: xây cặp (query, positive) từ KG (query = câu hỏi sinh từ entity/relation, positive = chunk/edge đúng), hard negatives từ BM25 trên corpus → LoRA Qwen3-Embedding-0.6B → đo Recall@k + nDCG trên dev set câu hỏi lịch sử → bảng before/after.
+- **Báo cáo**: điền số liệu thật vào khung, viết phần phân tích lỗi, kết luận.
+
+## 3. Phân công
+
+| Người | Việc | Ước lượng |
+|---|---|---|
+| **Tôi (AI)** | Toàn bộ code, chạy pipeline, chạy đánh giá, viết khung báo cáo | ~24 h công sức mô phỏng (không giới hạn bởi 2 ngày, nhưng bạn review) |
+| **Bạn** | 1) Tạo `.env` với `GEMINI_API_KEY` | 5 phút |
+| | 2) Duyệt câu hỏi trên Streamlit | 20–30 phút |
+| | 3) Đọc & duyệt báo cáo cuối, thuyết trình | 1–2 h |
+| | 4) Upload dataset lên Kaggle (tôi chuẩn bị sẵn file + lệnh) | 10 phút |
+
+## 4. Thứ tự cắt khi trễ hạn
+
+| Ưu tiên cắt | Hạng mục | Lý do |
+|---|---|---|
+| 1 (cắt đầu tiên) | Kaggle N2 (fine-tune) | Đẹp nhưng không cốt lõi; nếu còn thời gian thì làm sau |
+| 2 | UI tab "So sánh" & "Đánh giá" | Demo vẫn được với tab Chat + Đồ thị |
+| 3 | Bộ câu hỏi nguồn C (History Chat) | Có A+B+D là đủ |
+| 4 | Ablation A1/A5/A6 | Giữ lại A2 (entity resolution) + A3 (temporal) + A4 (graph) vì chúng là giả thuyết nghiên cứu chính |
+| 5 (không cắt) | Pipeline + B0/B1/B2/Ours + bảng so sánh + error analysis | **Đây là cột lưng của đồ án** |
+
+## 5. Định nghĩa "xong" (Definition of Done)
+
+- [ ] `scripts/run_all.sh` chạy từ máy sạch → ra đủ `reports/results.md`
+- [ ] KG ≥5.000 node / ≥15.000 edge, mỗi edge truy vết được chunk nguồn
+- [ ] Hệ thống trả lời được single-hop + multi-hop, có citation + chuỗi suy luận
+- [ ] Bảng B0/B1/B2/Ours tách theo nhóm, có CI 95% + McNemar
+- [ ] Bảng ablation A1–A7 (ít nhất A2, A3, A4)
+- [ ] Đo hallucination: groundedness + citation precision, so sánh với baseline
+- [ ] Error analysis có phân loại + ví dụ cụ thể
+- [ ] Streamlit demo chạy được, hiển thị nguồn + đồ thị
+- [ ] `README.md` + khung báo cáo + outline slide
+- [ ] Số liệu trong báo cáo **tái lập được** từ `results.csv`
+
+## 6. Điều kiện tiên quyết & rủi ro lịch
+
+| Rủi ro | Dấu hiệu sớm | Hành động |
+|---|---|---|
+| Gemini quota | `429` khi trích xuất hàng loạt | Giảm số chunk trích xuất; chuyển sang cache + chạy nhiều đợt |
+| Bộ câu hỏi không đủ chất lượng | < 100 câu verified sau bước 6 | Sinh thêm từ nguồn A (template) vì tự động kiểm chứng được |
+| F1 extractor thấp | < 0.5 ở bước 2 | Đơn giản hóa prompt, giới hạn ontology còn 12–15 event type phổ biến nhất |
+| KG quá rỗng (ít quan hệ nhân quả) | path hit thấp ở bước 5 | Bổ sung quan hệ `CAUSE_OF` từ LLM suy luận trên cặp event liên tiếp trong cùng chương |
+| Hệ thống không thắng baseline | Δ ≤ 0 ở bước 7 | Đây là kết quả khoa học hợp lệ — báo cáo minh bạch, tập trung vào *tại sao* (phân tích lỗi), đồng thời đề xuất hướng cải thiện |
