@@ -132,31 +132,8 @@ STOPWORDS: frozenset[str] = frozenset(
         "với",
         "vừa",
         "của",
-        "là",
-        "có",
-        "được",
-        "cho",
-        "với",
-        "các",
-        "những",
-        "một",
-        "này",
-        "đó",
-        "khi",
-        "nào",
-        "như",
-        "đã",
-        "sẽ",
-        "để",
         "về",
-        "trong",
-        "trên",
-        "ra",
-        "vào",
-        "theo",
         "năm",
-        "gì",
-        "ai",
         "thế",
         "sao",
         "nhiêu",
@@ -206,7 +183,6 @@ def token_f1(prediction: str, reference: str) -> float:
     ref_tokens = tokenize(reference)
     if not pred_tokens or not ref_tokens:
         return 1.0 if not pred_tokens and not ref_tokens else 0.0
-    common: dict[str, int] = {}
     ref_counts: dict[str, int] = {}
     for token in ref_tokens:
         ref_counts[token] = ref_counts.get(token, 0) + 1
@@ -367,7 +343,7 @@ def entity_recall(
     gold = [normalize_text(g) for g in (gold_entities or []) if str(g).strip()]
     if not gold:
         return 0.0
-    linked = {normalize_text(l) for l in (linked_entities or [])}
+    linked = {normalize_text(item) for item in (linked_entities or [])}
     linked |= {normalize_text(part) for name in linked for part in name.split()}
     hits = sum(1 for g in gold if g and (g in linked or g in " ".join(linked)))
     return hits / len(gold)

@@ -13,8 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
-import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -111,6 +110,9 @@ class EvalRow:
             "gold_fact_accuracy": round(self.gold_fact_accuracy, 6),
             "n_evidence": self.n_evidence,
             "n_citations": self.n_citations,
+            "linked_entities": list(self.linked_entities),
+            "retrieved_paths": list(self.retrieved_paths),
+            "retrieved_chunks": list(self.retrieved_chunks),
         }
 
 
@@ -245,8 +247,17 @@ def run_evaluation(
     limit: int | None = None,
     progress: bool = True,
     skip_existing: bool = True,
+    checkpoint_path: str | Path | None = None,
+    checkpoint_every: int = 5,
 ) -> EvalRun:
-    """Run every system over the dataset and score the answers."""
+    """Run every system over the dataset and score the answers.
+
+    ``checkpoint_path`` makes the run resumable: after every
+    ``checkpoint_every`` scored questions the partial rows are written to
+    disk, and a re-run with the same path skips the (system, qid) pairs
+    that are already present.  This matters a lot on free-tier LLM APIs
+    where a long run can die on a 429 half-way through.
+    """
     questions = list(dataset.questions if isinstance(dataset, EvalDataset) else dataset)
     if limit:
         questions = questions[: int(limit)]
@@ -258,11 +269,18 @@ def run_evaluation(
     if ablations:
         plan += [(name, {flag: True}) for name, flag in ABLATIONS.items()]
 
+    done_keys: set[tuple[str, str]] = set()
+    if skip_existing and checkpoint_path:
+        done_keys = _load_checkpoint_rows(checkpoint_path, run)
+
     total = len(questions) * len(plan)
     done = 0
     for system, ablation in plan:
         for question in questions:
             done += 1
+            key = (system, question.qid)
+            if key in done_keys:
+                continue
             if progress and done % 10 == 0:
                 logger.info("[eval] %d/%d (%s)", done, total, system)
             try:
@@ -276,8 +294,51 @@ def run_evaluation(
                 logger.warning("Chấm câu %s (%s) lỗi: %s", question.qid, system, exc)
                 continue
             run.rows.append(row)
-    _ = skip_existing
+            if checkpoint_path and len(run.rows) % max(1, checkpoint_every) == 0:
+                _save_checkpoint(checkpoint_path, run)
+    if checkpoint_path:
+        _save_checkpoint(checkpoint_path, run)
     return run
+
+
+def _load_checkpoint_rows(path: str | Path, run: EvalRun) -> set[tuple[str, str]]:
+    """Load previously scored rows from ``path`` into ``run``."""
+    source = Path(path)
+    if not source.exists():
+        return set()
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        logger.warning("Không đọc được checkpoint %s -- bắt đầu lại", source)
+        return set()
+    rows = payload.get("rows") or []
+    # NB: the key must be (system, qid) -- a question is answered by every
+    # system, so de-duplicating by qid alone would silently drop rows.
+    known = {(r.system, r.qid) for r in run.rows}
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        qid = str(raw.get("qid") or "")
+        system = str(raw.get("system") or "")
+        if not qid or not system or (system, qid) in known:
+            continue
+        run.rows.append(EvalRow(**{k: v for k, v in raw.items() if k in EvalRow.__annotations__}))
+        known.add((system, qid))
+    logger.info("Checkpoint: đã có %d dòng kết quả", len(run.rows))
+    return {(str(r.get("system")), str(r.get("qid"))) for r in rows}
+
+
+def _save_checkpoint(path: str | Path, run: EvalRun) -> None:
+    """Persist the rows of ``run`` so an interrupted run can be resumed."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps({"meta": run.meta, "rows": [r.to_dict() for r in run.rows]},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp.replace(target)
 
 
 # --------------------------------------------------------------------------

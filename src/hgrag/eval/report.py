@@ -16,7 +16,6 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from . import metrics as M
 from .error_analysis import write_error_analysis
 from .run_eval import ABLATIONS, EvalRun, compare_systems, summarize_run
 
@@ -211,7 +210,7 @@ def _ablation_table(run: EvalRun) -> str:
                 ph=_fmt(base.get("path_hit")),
             )
         )
-    for name, flag in ABLATIONS.items():
+    for name in ABLATIONS:
         s = summaries.get(name)
         if not s:
             continue

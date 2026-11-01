@@ -35,15 +35,7 @@ from hgrag.eval.dataset import EvalDataset  # noqa: E402
 from hgrag.eval.judge import build_judge  # noqa: E402
 from hgrag.eval.report import build_report  # noqa: E402
 from hgrag.eval.run_eval import SYSTEMS, compare_systems, run_evaluation  # noqa: E402
-from hgrag.kg.alias import AliasResolver  # noqa: E402
-from hgrag.kg.store import Neo4jGraphStore  # noqa: E402
-from hgrag.llm.client import MockLLMClient, build_llm_client  # noqa: E402
 from hgrag.qa.pipeline import QAPipeline  # noqa: E402
-from hgrag.retrieval.embeddings import MockEmbedder, build_embedder  # noqa: E402
-from hgrag.retrieval.entity_linker import EntityLinker  # noqa: E402
-from hgrag.retrieval.graph_search import GraphSearcher  # noqa: E402
-from hgrag.retrieval.rerank import build_reranker  # noqa: E402
-from hgrag.retrieval.vector_store import NumpyVectorStore, QdrantVectorStore  # noqa: E402
 
 logger = logging.getLogger("07_run_eval")
 
@@ -64,6 +56,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-ablations", action="store_true", help="bỏ 7 ablation")
     p.add_argument("--mock", action="store_true", help="chạy offline (mock LLM + embedder)")
     p.add_argument("--out", type=str, default=None, help="ghi raw rows ra file JSON")
+    p.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="file checkpoint (JSON) để resume khi run bị gián đoạn",
+    )
+    p.add_argument(
+        "--checkpoint-every", type=int, default=5, help="ghi checkpoint sau mỗi N dòng"
+    )
+    p.add_argument("--no-resume", action="store_true", help="bỏ qua checkpoint cũ")
     p.add_argument("--reports", type=str, default="reports", help="thư mục output của report")
     p.add_argument("--bootstrap", type=int, default=10_000, help="số lần lặp bootstrap")
     p.add_argument("--seed", type=int, default=42, help="random seed")
@@ -72,52 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def build_pipeline(mock: bool, settings: Any) -> QAPipeline:
-    if mock:
-        llm_client = MockLLMClient(embed_dim=settings.embed_dim, seed=settings.seed)
-        embedder = MockEmbedder(dim=settings.embed_dim)
-    else:
-        llm_client = build_llm_client(settings)
-        embedder = build_embedder(settings, llm_client)
+    from hgrag.qa.pipeline import build_pipeline as _factory
 
-    cfg = settings.neo4j
-    store = Neo4jGraphStore(
-        uri=settings.neo4j_uri,
-        user=str(cfg.get("user", "neo4j")),
-        password=settings.neo4j_password,
-        database=str(cfg.get("database", "neo4j")),
-    )
-    qcfg = settings.qdrant
-    try:
-        vector_store = QdrantVectorStore(
-            url=str(qcfg.get("url", "http://localhost:6333")),
-            vector_size=int(qcfg.get("vector_size", 768)),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Không kết nối được Qdrant (%s) -> NumpyVectorStore", exc)
-        vector_store = NumpyVectorStore()
-
-    linker = EntityLinker(
-        resolver=AliasResolver(
-            store=store,
-            llm_client=llm_client,
-            embedder=embedder,
-            settings=settings,
-        ),
-        settings=settings,
-    )
-    searcher = GraphSearcher(store=store, settings=settings, embedder=embedder)
-    reranker = build_reranker(settings, embedder)
-
-    return QAPipeline(
-        llm_client=llm_client,
-        embedder=embedder,
-        graph_store=store,
-        vector_store=vector_store,
-        entity_linker=linker,
-        graph_searcher=searcher,
-        reranker=reranker,
-        settings=settings,
-    )
+    return _factory(settings, mock=mock)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -153,6 +112,9 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     judge = build_judge(pipeline.llm_client, mock=args.mock)
+    checkpoint = args.checkpoint
+    if checkpoint and not Path(checkpoint).is_absolute():
+        checkpoint = str(REPO_ROOT / checkpoint)
     run = run_evaluation(
         pipeline,
         dataset,
@@ -160,6 +122,9 @@ def main(argv: list[str] | None = None) -> int:
         ablations=not args.no_ablations,
         judge=judge,
         limit=args.limit,
+        skip_existing=not args.no_resume,
+        checkpoint_path=checkpoint,
+        checkpoint_every=args.checkpoint_every,
     )
     if not run.rows:
         print(json.dumps({"error": "Không có dòng kết quả nào"}, ensure_ascii=False))

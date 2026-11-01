@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from . import metrics as M
-from .run_eval import EvalRun, EvalRow
+from .run_eval import EvalRow, EvalRun
 
 __all__ = ["classify_error", "analyze_errors", "write_error_analysis"]
 

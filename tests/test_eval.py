@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import math
-from typing import Any
-
 import pytest
 
-from hgrag.eval.dataset import EvalDataset, EvalQuestion, load_jsonl, save_jsonl
+from hgrag.eval.dataset import EvalDataset, EvalQuestion, load_jsonl
 from hgrag.eval.judge import HeuristicJudge, LLMJudge, build_judge
 from hgrag.eval.metrics import (
     aggregate,
@@ -32,14 +29,12 @@ from hgrag.eval.metrics import (
 )
 from hgrag.eval.run_eval import (
     ABLATIONS,
-    SYSTEMS,
     EvalRow,
     compare_systems,
     run_evaluation,
     summarize_run,
     summarize_system,
 )
-
 
 # --------------------------------------------------------------------------
 # lexical metrics
@@ -418,3 +413,75 @@ def test_eval_row_to_dict_is_json_serialisable() -> None:
 
     row = EvalRow(qid="q1", system="ours", question="q")
     json.dumps(row.to_dict(), ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------
+# checkpoint / resume
+# --------------------------------------------------------------------------
+
+
+class _CountingPipeline(_StubPipeline):
+    """Đếm số lần được gọi (để kiểm tra resume có bỏ qua việc đã làm)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def ask(self, question, ablation=None, system="ours", **kwargs):  # noqa: D102
+        self.calls += 1
+        return super().ask(question, ablation=ablation, system=system, **kwargs)
+
+
+def test_checkpoint_is_written_and_reused(tmp_path) -> None:
+    ckpt = tmp_path / "ckpt.json"
+    pipeline = _CountingPipeline()
+    run = run_evaluation(
+        pipeline,
+        _dataset(),
+        systems=("ours",),
+        ablations=False,
+        judge=HeuristicJudge(),
+        checkpoint_path=ckpt,
+        checkpoint_every=1,
+    )
+    assert ckpt.exists()
+    assert len(run.rows) == 2
+    assert pipeline.calls == 2
+
+    # Chạy lại: pipeline mới, cùng checkpoint -> không gọi lại câu đã chấm.
+    pipeline2 = _CountingPipeline()
+    run2 = run_evaluation(
+        pipeline2,
+        _dataset(),
+        systems=("ours",),
+        ablations=False,
+        judge=HeuristicJudge(),
+        checkpoint_path=ckpt,
+        checkpoint_every=1,
+    )
+    assert pipeline2.calls == 0
+    assert len(run2.rows) == 2
+
+
+def test_checkpoint_resume_keeps_previous_rows(tmp_path) -> None:
+    ckpt = tmp_path / "ckpt.json"
+    run_evaluation(
+        _CountingPipeline(),
+        _dataset(),
+        systems=("ours",),
+        ablations=False,
+        judge=HeuristicJudge(),
+        checkpoint_path=ckpt,
+        checkpoint_every=1,
+    )
+    run = run_evaluation(
+        _CountingPipeline(),
+        _dataset(),
+        systems=("ours",),
+        ablations=False,
+        judge=HeuristicJudge(),
+        checkpoint_path=ckpt,
+        checkpoint_every=1,
+        skip_existing=False,
+    )
+    assert len(run.rows) == 2

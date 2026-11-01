@@ -158,6 +158,7 @@ class GeminiClient(LLMClient):
         embed_batch_size: int = 16,
         embed_max_retries: int = 8,
         max_rate_limit_wait: float = 90.0,
+        fallback_embed_models: list[str] | None = None,
     ):
         try:
             from google import genai  # type: ignore
@@ -183,6 +184,13 @@ class GeminiClient(LLMClient):
         self.embed_batch_size = max(1, int(embed_batch_size))
         self.embed_max_retries = max(1, int(embed_max_retries))
         self.max_rate_limit_wait = float(max_rate_limit_wait)
+        # The embedding model has its *own* quota, separate from the chat
+        # models.  When it is exhausted we rotate to a sibling embedding
+        # model -- but the corpus must then be re-embedded with the same
+        # model, otherwise the vector space no longer matches.
+        self.fallback_embed_models = [
+            m for m in (fallback_embed_models or []) if m and m != embed_model
+        ]
         self._client = genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
         self._embed_dim = output_dim or 768
 
@@ -311,53 +319,142 @@ class GeminiClient(LLMClient):
         The free tier of ``gemini-embedding-001`` allows a limited number of
         embed requests *per minute*; the method therefore backs off and
         retries instead of failing the whole run.
+
+        Results are cached on disk (keyed by model + text) so that repeated
+        evaluation runs over the same questions do not consume quota twice.
         """
         if not texts:
             return []
-        out: list[list[float]] = []
-        for i in range(0, len(texts), self.embed_batch_size):
-            batch = texts[i : i + self.embed_batch_size]
+        results: list[list[float] | None] = []
+        pending: list[str] = []
+        # text -> every position in ``results`` that needs its vector
+        pending_slots: dict[str, list[int]] = {}
+        for text in texts:
+            hit = self._embed_cache_get(text)
+            if hit is not None:
+                results.append(hit)
+                continue
+            pending_slots.setdefault(text, []).append(len(results))
+            if text not in pending_slots or len(pending_slots[text]) == 1:
+                pending.append(text)
+            results.append(None)
+        for start in range(0, len(pending), self.embed_batch_size):
+            batch = pending[start : start + self.embed_batch_size]
             vectors = self._embed_batch(batch)
-            out.extend(vectors)
+            for text, vec in zip(batch, vectors, strict=False):
+                self._embed_cache_put(text, vec)
+                for slot in pending_slots[text]:
+                    results[slot] = vec
+        out = [r if r is not None else [] for r in results]
         if out:
             self._embed_dim = len(out[0])
         return out
 
+    def _embed_cache_key(self, text: str) -> str:
+        return stable_hash({"model": self.embed_model, "text": text, "dim": self.output_dim})
+
+    def _embed_cache_get(self, text: str) -> list[float] | None:
+        if self.cache is None:
+            return None
+        payload = self.cache.get(self._embed_cache_key(text))
+        if not payload:
+            return None
+        vec = payload.get("vector")
+        if isinstance(vec, list) and vec:
+            return [float(x) for x in vec]
+        return None
+
+    def _embed_cache_put(self, text: str, vector: list[float]) -> None:
+        if self.cache is None:
+            return
+        self.cache.put(
+            self._embed_cache_key(text),
+            {"vector": list(vector), "model": self.embed_model},
+        )
+
     def _embed_batch(self, batch: list[str]) -> list[list[float]]:
         """Embed one batch, retrying with the delay suggested by the API.
 
-        The free tier of ``gemini-embedding-001`` limits the number of embed
-        *tokens* per minute (30 000).  When the limit is hit the API returns a
-        ``RetryInfo`` telling how long to wait -- we honour it instead of
-        failing the whole run.
+        The free tier of the embedding models limits the number of embed
+        *tokens* per minute (and per day).  When the limit is hit the API
+        returns a ``RetryInfo`` telling how long to wait -- we honour it, but
+        only up to ``max_rate_limit_wait`` seconds: a *daily* quota reset
+        (which can be ~20 hours away) must fail fast instead of freezing the
+        whole run.  In that case we rotate to a sibling embedding model.
+
+        Some embedding models (``gemini-embedding-2``) only accept a *single*
+        input per request, so the batch is split into one call per text
+        whenever the API returns fewer vectors than requested.
         """
         last_error: Exception | None = None
-        for attempt in range(self.embed_max_retries):
-            try:
-                kwargs: dict[str, Any] = {"model": self.embed_model, "contents": batch}
-                if self.output_dim:
-                    kwargs["config"] = {"output_dimensionality": self.output_dim}
-                resp = self._client.models.embed_content(**kwargs)
-                vectors: list[list[float]] = []
-                for item in resp.embeddings:
-                    vec = list(item.values)
-                    norm = math.sqrt(sum(x * x for x in vec)) or 1.0
-                    vectors.append([x / norm for x in vec])
-                return vectors
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                delay = _retry_after_seconds(exc) or (self.retry_base_delay * (2**attempt))
-                logger.warning(
-                    "Embed call failed (attempt %d/%d): %s -- retry sau %.1fs",
-                    attempt + 1,
-                    self.embed_max_retries,
-                    str(exc)[:160],
-                    delay,
-                )
-                time.sleep(delay)
+        models_to_try = [self.embed_model, *self.fallback_embed_models]
+        for model_name in models_to_try:
+            for attempt in range(self.embed_max_retries):
+                try:
+                    vectors = self._embed_once(model_name, batch)
+                    if len(vectors) != len(batch):
+                        # The model collapsed the batch into a single vector:
+                        # embed the texts one by one instead.
+                        vectors = []
+                        for text in batch:
+                            single = self._embed_once(model_name, [text])
+                            vectors.extend(single)
+                    if model_name != self.embed_model:
+                        logger.warning(
+                            "Đã chuyển sang model embedding %s (quota của %s đã cạn)",
+                            model_name,
+                            self.embed_model,
+                        )
+                        self.embed_model = model_name
+                    return vectors
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    suggested = _retry_after_seconds(exc)
+                    if suggested is not None and suggested > self.max_rate_limit_wait:
+                        logger.warning(
+                            "Embed quota của %s đã cạn (cần chờ %.0fs) -> thử model khác",
+                            model_name,
+                            suggested,
+                        )
+                        break
+                    delay = suggested or (self.retry_base_delay * (2**attempt))
+                    logger.warning(
+                        "Embed call failed (attempt %d/%d, model=%s): %s -- retry sau %.1fs",
+                        attempt + 1,
+                        self.embed_max_retries,
+                        model_name,
+                        str(exc)[:160],
+                        delay,
+                    )
+                    time.sleep(delay)
         raise LLMError(
             f"Embed call thất bại sau {self.embed_max_retries} lần thử: {last_error}"
         )
+
+    def _embed_once(self, model_name: str, batch: list[str]) -> list[list[float]]:
+        """One API call; returns the (normalised) vectors it produced.
+
+        The batch is sent as a list of ``Content`` objects when the SDK
+        exposes them: some embedding models (e.g. ``gemini-embedding-2``)
+        collapse a list of plain strings into a *single* vector, while a list
+        of ``Content`` keeps one vector per input.
+        """
+        types = getattr(self._genai, "types", None)
+        contents: list[Any] = batch
+        if types is not None:
+            contents = [
+                types.Content(parts=[types.Part(text=text)]) for text in batch
+            ]
+        kwargs: dict[str, Any] = {"model": model_name, "contents": contents}
+        if self.output_dim:
+            kwargs["config"] = {"output_dimensionality": self.output_dim}
+        resp = self._client.models.embed_content(**kwargs)
+        vectors: list[list[float]] = []
+        for item in resp.embeddings:
+            vec = list(item.values)
+            norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+            vectors.append([x / norm for x in vec])
+        return vectors
 
     @property
     def embed_dim(self) -> int:
@@ -529,6 +626,7 @@ def build_llm_client(settings: Any | None = None) -> LLMClient:
                 cache_enabled=llm_cfg.get("cache_enabled", True),
                 output_dim=settings.embed_dim,
                 fallback_models=llm_cfg.get("fallback_models", []),
+                fallback_embed_models=llm_cfg.get("fallback_embed_models", []),
             )
         except LLMError as exc:
             logger.warning("Không khởi tạo được GeminiClient (%s) -> dùng mock", exc)

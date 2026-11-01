@@ -21,7 +21,7 @@ from hgrag.qa.answer import (
     validate_citations,
 )
 from hgrag.qa.explain import Explainer, format_paths
-from hgrag.qa.pipeline import ABLATION_FLAGS, QAPipeline, REFUSAL_ANSWER
+from hgrag.qa.pipeline import ABLATION_FLAGS, REFUSAL_ANSWER, QAPipeline
 from hgrag.qa.query_understanding import (
     QueryUnderstanding,
     QueryUnderstandingModule,

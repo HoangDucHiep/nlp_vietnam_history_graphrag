@@ -395,6 +395,117 @@ class TestGeminiClientMocked:
         client = GeminiClient(model="gemini-test", api_key="k", cache_dir=tmp_path / "cache")
         assert client.embed([]) == []
 
+    def test_embed_is_cached_on_disk(self, monkeypatch, tmp_path: Path):
+        calls = {"n": 0}
+
+        class _Emb:
+            def __init__(self, values):
+                self.values = values
+
+        class _EmbedModels:
+            def embed_content(self, **kwargs: Any):
+                calls["n"] += 1
+                return SimpleNamespace(embeddings=[_Emb([3.0, 4.0])])
+
+        genai_module = SimpleNamespace(
+            Client=lambda **kwargs: SimpleNamespace(models=_EmbedModels())
+        )
+        google_module = SimpleNamespace(genai=genai_module)
+        import sys
+
+        monkeypatch.setitem(sys.modules, "google", google_module)
+        monkeypatch.setitem(sys.modules, "google.genai", genai_module)
+
+        client = GeminiClient(model="gemini-test", api_key="k", cache_dir=tmp_path / "cache")
+        first = client.embed(["một câu"])
+        second = client.embed(["một câu"])
+        assert first == second
+        assert calls["n"] == 1  # lần hai lấy từ cache đĩa
+
+    def test_embed_cache_is_keyed_by_model(self, monkeypatch, tmp_path: Path):
+        """Vector của model khác phải nằm ở khoá cache khác."""
+        client = GeminiClient(
+            model="gemini-test", api_key="k", cache_dir=tmp_path / "cache"
+        )
+        key_a = client._embed_cache_key("một câu")
+        client.embed_model = "model-khác"
+        key_b = client._embed_cache_key("một câu")
+        assert key_a != key_b
+
+    def test_embed_rotates_to_fallback_model_on_daily_quota(self, monkeypatch, tmp_path: Path):
+        """Khi model chính hết quota, client chuyển sang model dự phòng."""
+        used: list[str] = []
+
+        class _Emb:
+            def __init__(self, values):
+                self.values = values
+
+        class _EmbedModels:
+            def embed_content(self, **kwargs: Any):
+                model = kwargs.get("model")
+                used.append(model)
+                if model == "model-chính":
+                    err = RuntimeError("quota hết")
+                    err.code = 429
+                    err.response = SimpleNamespace(
+                        json=lambda: {
+                            "details": [
+                                {"retryInfo": [{"retryDelay": "72000s"}]}
+                            ]
+                        }
+                    )
+                    raise err
+                return SimpleNamespace(embeddings=[_Emb([3.0, 4.0])])
+
+        genai_module = SimpleNamespace(
+            Client=lambda **kwargs: SimpleNamespace(models=_EmbedModels())
+        )
+        google_module = SimpleNamespace(genai=genai_module)
+        import sys
+
+        monkeypatch.setitem(sys.modules, "google", google_module)
+        monkeypatch.setitem(sys.modules, "google.genai", genai_module)
+
+        client = GeminiClient(
+            model="gemini-test",
+            api_key="k",
+            cache_dir=tmp_path / "cache",
+            embed_model="model-chính",
+            fallback_embed_models=["model-dự-phòng"],
+        )
+        vec = client.embed(["một câu"])
+        assert vec == [[0.6, 0.8]]
+        assert "model-dự-phòng" in used
+        assert client.embed_model == "model-dự-phòng"
+
+    def test_embed_splits_batch_when_model_collapses_it(self, monkeypatch, tmp_path: Path):
+        """Một số model trả về 1 vector cho cả batch -> client phải tách."""
+
+        class _Emb:
+            def __init__(self, values):
+                self.values = values
+
+        class _EmbedModels:
+            def embed_content(self, **kwargs: Any):
+                contents = kwargs.get("contents") or []
+                if len(contents) > 1:
+                    return SimpleNamespace(embeddings=[_Emb([1.0, 0.0])])
+                return SimpleNamespace(embeddings=[_Emb([1.0, 0.0])])
+
+        genai_module = SimpleNamespace(
+            Client=lambda **kwargs: SimpleNamespace(models=_EmbedModels())
+        )
+        google_module = SimpleNamespace(genai=genai_module)
+        import sys
+
+        monkeypatch.setitem(sys.modules, "google", google_module)
+        monkeypatch.setitem(sys.modules, "google.genai", genai_module)
+
+        client = GeminiClient(model="gemini-test", api_key="k", cache_dir=tmp_path / "cache")
+        vec = client.embed(["a", "b"])
+        assert len(vec) == 2
+        assert all(len(v) == 2 for v in vec)
+
     def test_system_instruction_split(self, monkeypatch, tmp_path: Path):
         models = _install_fake_genai(monkeypatch, lambda kwargs: _ok_response("ok"))
         req = LLMRequest(
