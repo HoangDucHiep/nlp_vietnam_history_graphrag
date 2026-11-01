@@ -125,6 +125,61 @@ DEFAULT_RELATION = "ABOUT"
 
 _ROLE_RE = re.compile(r"[^A-Z0-9]+")
 
+#: Free-text roles an LLM commonly produces mapped onto the 11 VHE roles.
+#: Without this, an extracted event would be rejected by
+#: :func:`validate_event` and the chunk would yield no relation at all.
+ROLE_ALIASES: dict[str, str] = {
+    # participants
+    "COMMANDER": "AGENT",
+    "LEADER": "AGENT",
+    "ACTOR": "AGENT",
+    "ACTOR_1": "AGENT",
+    "ACTOR_2": "AGENT",
+    "PARTICIPANT": "AGENT",
+    "PERSON": "AGENT",
+    "PROTAGONIST": "AGENT",
+    "WINNER": "AGENT",
+    "OPPORTUNIST": "AGENT",
+    "INITIATOR": "AGENT",
+    "VICTIM": "EXPERIENCER",
+    "AFFECTED": "EXPERIENCER",
+    "PATIENT": "EXPERIENCER",
+    "RECIPIENT": "BENEFICIARY",
+    "RECIPIENT_1": "BENEFICIARY",
+    "RECIPIENT_2": "BENEFICIARY",
+    "OPPOSITION": "FORCE",
+    "OPPOSING_FORCE": "FORCE",
+    "ENEMY": "FORCE",
+    "ADVERSARY": "FORCE",
+    "MILITARY_FORCE": "FORCE",
+    "ARMY": "FORCE",
+    "TROOPS": "FORCE",
+    "WEAPON": "INSTRUMENT",
+    "TOOL": "INSTRUMENT",
+    "MEANS": "INSTRUMENT",
+    "VEHICLE": "INSTRUMENT",
+    "DOCUMENT": "CONTENT",
+    "TEXT": "CONTENT",
+    "SUBJECT_MATTER": "THEME",
+    "TOPIC": "THEME",
+    "PURPOSE": "GOAL",
+    "OBJECTIVE": "GOAL",
+    # context
+    "PLACE": "LOCATION",
+    "LOCATION_1": "LOCATION",
+    "LOCATION_2": "LOCATION",
+    "SITE": "LOCATION",
+    "SPOT": "LOCATION",
+    "TIME": "TEMPORAL",
+    "DATE": "TEMPORAL",
+    "PERIOD": "TEMPORAL",
+    "YEAR": "TEMPORAL",
+    "WHEN": "TEMPORAL",
+    "SOURCE_OF_INFORMATION": "SOURCE",
+    "REFERENCE": "SOURCE",
+    "CITATION": "SOURCE",
+}
+
 
 def normalize_role(role: str) -> str:
     """Normalise an argument role to UPPER_SNAKE.
@@ -137,7 +192,8 @@ def normalize_role(role: str) -> str:
     if not role:
         return ""
     text = _ROLE_RE.sub("_", str(role).strip().upper()).strip("_")
-    return text
+    # Free-text LLM roles ("Commander", "Opponent", ...) map onto a VHE role.
+    return ROLE_ALIASES.get(text, text)
 
 
 #: Common English / capitalised spellings mapped onto the VHE event types.

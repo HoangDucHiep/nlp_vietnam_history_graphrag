@@ -124,6 +124,7 @@ class GeminiClient(LLMClient):
         cache_dir: Path | str | None = None,
         cache_enabled: bool = True,
         output_dim: int | None = None,
+        fallback_models: list[str] | None = None,
     ):
         try:
             from google import genai  # type: ignore
@@ -142,6 +143,10 @@ class GeminiClient(LLMClient):
         self.retry_base_delay = retry_base_delay
         self.cache = DiskCache(cache_dir) if cache_enabled and cache_dir else None
         self.output_dim = output_dim
+        # Free-tier API keys have a per-model daily quota (20 req/day for the
+        # Flash models).  When a model is exhausted we transparently rotate to
+        # the next one instead of failing the whole pipeline.
+        self.fallback_models = [m for m in (fallback_models or []) if m and m != model]
         self._client = genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
         self._embed_dim = output_dim or 768
 
@@ -155,6 +160,29 @@ class GeminiClient(LLMClient):
         return system, rest
 
     # -- API -------------------------------------------------------------
+    @staticmethod
+    def _sanitize_schema(schema: dict[str, Any]) -> dict[str, Any]:
+        """Make a JSON schema acceptable by the Gemini structured-output API.
+
+        Gemini rejects union types (``"type": ["integer", "null"]``) and a few
+        other JSON-Schema-only constructs.  We keep the first concrete type and
+        let the caller handle missing/``null`` values itself.
+        """
+        if not isinstance(schema, dict):
+            return schema
+        out = {k: v for k, v in schema.items() if k != "additionalProperties"}
+        if "type" in out and isinstance(out["type"], list):
+            concrete = [x for x in out["type"] if x != "null"]
+            out["type"] = concrete[0] if concrete else "string"
+        if isinstance(out.get("properties"), dict):
+            out["properties"] = {
+                k: GeminiClient._sanitize_schema(v) if isinstance(v, dict) else v
+                for k, v in out["properties"].items()
+            }
+        if isinstance(out.get("items"), dict):
+            out["items"] = GeminiClient._sanitize_schema(out["items"])
+        return out
+
     def generate(self, request: LLMRequest) -> LLMResponse:
         key = self._cache_key(request)
         if self.cache is not None:
@@ -171,53 +199,65 @@ class GeminiClient(LLMClient):
         }
         if request.response_schema:
             config["response_mime_type"] = "application/json"
-            config["response_schema"] = request.response_schema
+            config["response_schema"] = self._sanitize_schema(request.response_schema)
 
         last_error: Exception | None = None
-        for attempt in range(self.max_retries):
-            try:
-                kwargs: dict[str, Any] = {"model": request.model or self.model, "contents": prompt}
-                if system:
-                    kwargs["config"] = {
-                        **config,
-                        "system_instruction": system,
+        models_to_try = [request.model or self.model, *self.fallback_models]
+        for model_name in models_to_try:
+            for attempt in range(self.max_retries):
+                try:
+                    kwargs: dict[str, Any] = {"model": model_name, "contents": prompt}
+                    if system:
+                        kwargs["config"] = {
+                            **config,
+                            "system_instruction": system,
+                        }
+                    else:
+                        kwargs["config"] = config
+                    resp = self._client.models.generate_content(**kwargs)
+                    text = getattr(resp, "text", "") or ""
+                    usage = getattr(resp, "usage_metadata", None)
+                    payload = {
+                        "text": text,
+                        "model": model_name,
+                        "usage": {
+                            "prompt_tokens": getattr(usage, "prompt_token_count", None),
+                            "output_tokens": getattr(usage, "candidates_token_count", None),
+                        }
+                        if usage
+                        else {},
                     }
-                else:
-                    kwargs["config"] = config
-                resp = self._client.models.generate_content(**kwargs)
-                text = getattr(resp, "text", "") or ""
-                usage = getattr(resp, "usage_metadata", None)
-                payload = {
-                    "text": text,
-                    "model": request.model or self.model,
-                    "usage": {
-                        "prompt_tokens": getattr(usage, "prompt_token_count", None),
-                        "output_tokens": getattr(usage, "candidates_token_count", None),
-                    }
-                    if usage
-                    else {},
-                }
-                if self.cache is not None:
-                    self.cache.put(key, payload)
-                return LLMResponse(text=text, model=payload["model"], cached=False, raw=payload)
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                status = getattr(getattr(exc, "code", None), "value", None) or getattr(
-                    exc, "code", None
-                )
-                code = int(status) if isinstance(status, int) else None
-                if code is not None and code not in RETRYABLE_STATUS:
-                    raise LLMError(f"Gemini lỗi không retryable ({code}): {exc}") from exc
-                delay = self.retry_base_delay * (2**attempt)
-                logger.warning(
-                    "Gemini call failed (attempt %d/%d): %s -- retry sau %.1fs",
-                    attempt + 1,
-                    self.max_retries,
-                    exc,
-                    delay,
-                )
-                time.sleep(delay)
-        raise LLMError(f"Gemini call thất bại sau {self.max_retries} lần: {last_error}")
+                    if self.cache is not None:
+                        self.cache.put(key, payload)
+                    return LLMResponse(text=text, model=model_name, cached=False, raw=payload)
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    status = getattr(getattr(exc, "code", None), "value", None) or getattr(
+                        exc, "code", None
+                    )
+                    code = int(status) if isinstance(status, int) else None
+                    if code == 429:
+                        # Free-tier daily quota for this model is exhausted ->
+                        # rotate to the next model instead of burning retries.
+                        logger.warning(
+                            "Gemini quota hết cho model %s -> chuyển model khác", model_name
+                        )
+                        break
+                    if code is not None and code not in RETRYABLE_STATUS:
+                        raise LLMError(
+                            f"Gemini lỗi không retryable ({code}) với model {model_name}: {exc}"
+                        ) from exc
+                    delay = self.retry_base_delay * (2**attempt)
+                    logger.warning(
+                        "Gemini call failed (model=%s, attempt %d/%d): %s -- retry sau %.1fs",
+                        model_name,
+                        attempt + 1,
+                        self.max_retries,
+                        exc,
+                        delay,
+                    )
+                    time.sleep(delay)
+        raise LLMError(f"Gemini call thất bại sau khi thử {models_to_try}: {last_error}")
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
@@ -395,6 +435,7 @@ def build_llm_client(settings: Any | None = None) -> LLMClient:
                 cache_dir=settings.cache_dir,
                 cache_enabled=llm_cfg.get("cache_enabled", True),
                 output_dim=settings.embed_dim,
+                fallback_models=llm_cfg.get("fallback_models", []),
             )
         except LLMError as exc:
             logger.warning("Không khởi tạo được GeminiClient (%s) -> dùng mock", exc)

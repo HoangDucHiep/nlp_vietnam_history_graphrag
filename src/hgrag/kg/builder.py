@@ -29,7 +29,7 @@ from ..data.normalize import name_key
 from ..data.records import Chunk, Entity, Relation, stable_uid
 from .alias import AliasResolver
 from .ontology import ONTOLOGY as _DEFAULT_ONTOLOGY
-from .ontology import Ontology, relation_for_role
+from .ontology import Ontology, normalize_role, relation_for_role
 
 logger = logging.getLogger(__name__)
 
@@ -254,7 +254,7 @@ class KGBuilder:
         entities[event_uid] = event_entity
 
         for arg in event.arguments or []:
-            role = str(arg.get("role") or "").upper()
+            role = normalize_role(str(arg.get("role") or ""))
             name = str(arg.get("name") or "").strip()
             if not role or not name:
                 stats.n_skipped += 1
