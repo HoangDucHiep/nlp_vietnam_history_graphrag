@@ -7,6 +7,7 @@ touching the KG builder or the retrieval layer.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Iterable
 from typing import Any, Protocol, runtime_checkable
@@ -14,6 +15,19 @@ from typing import Any, Protocol, runtime_checkable
 from ..data.records import Entity, Relation
 
 logger = logging.getLogger(__name__)
+
+
+def _restore_extra(props: dict[str, Any]) -> dict[str, Any]:
+    """Neo4j cannot store nested maps: ``extra`` is persisted as JSON text."""
+    raw = props.pop("extra_json", None)
+    if raw is not None:
+        try:
+            props["extra"] = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, TypeError):
+            props["extra"] = {}
+    if not isinstance(props.get("extra"), dict):
+        props["extra"] = {}
+    return props
 
 
 @runtime_checkable
@@ -88,13 +102,22 @@ class Neo4jGraphStore:
         logger.info("Đã kết nối Neo4j tại %s", uri)
 
     # -- internals -------------------------------------------------------
-    def _run(self, query: str, **params: Any):
+    def _run(self, query: str, **params: Any) -> list[dict[str, Any]]:
+        """Run a Cypher query and materialise all records inside the session.
+
+        The result MUST be consumed before the session closes, otherwise the
+        driver raises ``ResultConsumedError``.
+        """
         with self._driver.session(database=self.database) as session:
-            return session.run(query, **params)
+            result = session.run(query, **params)
+            return [dict(record) for record in result]
 
     @staticmethod
     def _entity_props(entity: Entity) -> dict[str, Any]:
-        return entity_props(entity)
+        props = entity_props(entity)
+        # Neo4j properties must be primitives/lists -> serialise the nested map
+        props["extra_json"] = json.dumps(props.pop("extra", {}), ensure_ascii=False)
+        return props
 
     # -- writes ----------------------------------------------------------
     def upsert_entities(self, entities: Iterable[Entity]) -> int:
@@ -109,8 +132,8 @@ class Neo4jGraphStore:
         """
         total = 0
         for i in range(0, len(rows), self.batch_size):
-            result = self._run(query, rows=rows[i : i + self.batch_size])
-            total += int(result.single()["n"])
+            records = self._run(query, rows=rows[i : i + self.batch_size])
+            total += int(records[0]["n"]) if records else 0
         return total
 
     def upsert_relations(self, relations: Iterable[Relation]) -> int:
@@ -130,7 +153,7 @@ class Neo4jGraphStore:
                     "source": r.source,
                     "confidence": r.confidence,
                     "source_chunk_ids": r.source_chunk_ids,
-                    "extra": r.extra,
+                    "extra_json": json.dumps(r.extra, ensure_ascii=False),
                 }
             )
         total = 0
@@ -146,20 +169,21 @@ class Neo4jGraphStore:
             RETURN count(r) AS n
             """
             for i in range(0, len(rows), self.batch_size):
-                result = self._run(query, rows=rows[i : i + self.batch_size])
-                total += int(result.single()["n"])
+                records = self._run(query, rows=rows[i : i + self.batch_size])
+                total += int(records[0]["n"]) if records else 0
         return total
 
     # -- reads -----------------------------------------------------------
     def get_entity(self, uid: str) -> dict[str, Any] | None:
-        result = self._run(
+        records = self._run(
             "MATCH (e:Entity {uid: $uid}) RETURN e{.*} AS props", uid=uid
         )
-        rec = result.single()
-        return dict(rec["props"]) if rec else None
+        if not records:
+            return None
+        return _restore_extra(dict(records[0]["props"]))
 
     def find_entity_by_name(self, name: str) -> list[dict[str, Any]]:
-        result = self._run(
+        records = self._run(
             """
             MATCH (e:Entity)
             WHERE e.name = $name OR $name IN e.aliases OR e.name_key = $name
@@ -167,7 +191,7 @@ class Neo4jGraphStore:
             """,
             name=name,
         )
-        return [dict(r["props"]) for r in result]
+        return [_restore_extra(dict(r["props"])) for r in records]
 
     def neighbors(self, uid: str, rel_types: list[str] | None = None) -> list[dict[str, Any]]:
         rel_filter = ""
@@ -175,7 +199,7 @@ class Neo4jGraphStore:
             safe = [t for t in rel_types if t.replace("_", "").isalnum()]
             if safe:
                 rel_filter = ":" + "|".join(safe)
-        result = self._run(
+        records = self._run(
             f"""
             MATCH (a:Entity {{uid: $uid}})-[r{rel_filter}]-(b:Entity)
             RETURN a{{.*}} AS src, type(r) AS rel, properties(r) AS rprops, b{{.*}} AS dst
@@ -185,16 +209,16 @@ class Neo4jGraphStore:
         )
         return [
             {
-                "src": dict(r["src"]),
+                "src": _restore_extra(dict(r["src"])),
                 "rel": r["rel"],
-                "rel_props": dict(r["rprops"]),
-                "dst": dict(r["dst"]),
+                "rel_props": _restore_extra(dict(r["rprops"])),
+                "dst": _restore_extra(dict(r["dst"])),
             }
-            for r in result
+            for r in records
         ]
 
     def stats(self) -> dict[str, Any]:
-        result = self._run(
+        records = self._run(
             """
             MATCH (e:Entity)
             WITH count(e) AS nodes, collect(DISTINCT e.entity_type) AS types
@@ -203,9 +227,9 @@ class Neo4jGraphStore:
             RETURN nodes, types, rels
             """
         )
-        rec = result.single()
-        if rec is None:
+        if not records:
             return {"nodes": 0, "relations": 0, "entity_types": []}
+        rec = records[0]
         return {
             "nodes": int(rec["nodes"]),
             "relations": int(rec["rels"]),

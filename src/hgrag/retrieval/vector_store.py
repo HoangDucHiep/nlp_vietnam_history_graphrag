@@ -205,7 +205,7 @@ def build_graph_store(settings: Any | None = None, prefer_remote: bool = True) -
         settings = get_settings()
     if prefer_remote:
         try:
-            from .kg.store import Neo4jGraphStore
+            from ..kg.store import Neo4jGraphStore
 
             nc = settings.neo4j
             return Neo4jGraphStore(
@@ -217,6 +217,6 @@ def build_graph_store(settings: Any | None = None, prefer_remote: bool = True) -
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Không kết nối được Neo4j (%s) -> dùng InMemory fallback", exc)
-    from .kg.store import InMemoryGraphStore
+    from ..kg.store import InMemoryGraphStore
 
     return InMemoryGraphStore()
