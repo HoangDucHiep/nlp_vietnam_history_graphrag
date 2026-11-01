@@ -42,6 +42,8 @@ class GraphStore(Protocol):
 
     def find_entity_by_name(self, name: str) -> list[dict[str, Any]]: ...
 
+    def list_entities(self, limit: int | None = None) -> list[dict[str, Any]]: ...
+
     def neighbors(self, uid: str, rel_types: list[str] | None = None) -> list[dict[str, Any]]: ...
 
     def stats(self) -> dict[str, Any]: ...
@@ -193,6 +195,14 @@ class Neo4jGraphStore:
         )
         return [_restore_extra(dict(r["props"])) for r in records]
 
+    def list_entities(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """All entities of the graph (used to build the alias index)."""
+        query = "MATCH (e:Entity) RETURN e{.*} AS props"
+        if limit:
+            query += f" LIMIT {int(limit)}"
+        records = self._run(query)
+        return [_restore_extra(dict(r["props"])) for r in records]
+
     def neighbors(self, uid: str, rel_types: list[str] | None = None) -> list[dict[str, Any]]:
         rel_filter = ""
         if rel_types:
@@ -287,6 +297,12 @@ class InMemoryGraphStore:
             ):
                 out.append(props)
         return out[:20]
+
+    def list_entities(self, limit: int | None = None) -> list[dict[str, Any]]:
+        rows = list(self.entities.values())
+        if limit:
+            rows = rows[: int(limit)]
+        return [dict(r) for r in rows]
 
     def neighbors(self, uid: str, rel_types: list[str] | None = None) -> list[dict[str, Any]]:
         out = []

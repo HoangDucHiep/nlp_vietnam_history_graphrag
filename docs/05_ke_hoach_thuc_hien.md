@@ -170,16 +170,52 @@ gantt
 
 ## 5. Định nghĩa "xong" (Definition of Done)
 
-- [ ] `scripts/run_all.sh` chạy từ máy sạch → ra đủ `reports/results.md`
-- [ ] KG ≥5.000 node / ≥15.000 edge, mỗi edge truy vết được chunk nguồn
-- [ ] Hệ thống trả lời được single-hop + multi-hop, có citation + chuỗi suy luận
-- [ ] Bảng B0/B1/B2/Ours tách theo nhóm, có CI 95% + McNemar
-- [ ] Bảng ablation A1–A7 (ít nhất A2, A3, A4)
-- [ ] Đo hallucination: groundedness + citation precision, so sánh với baseline
-- [ ] Error analysis có phân loại + ví dụ cụ thể
-- [ ] Streamlit demo chạy được, hiển thị nguồn + đồ thị
-- [ ] `README.md` + khung báo cáo + outline slide
-- [ ] Số liệu trong báo cáo **tái lập được** từ `results.csv`
+- [x] `scripts/run_all.sh` chạy từ máy sạch → ra đủ `reports/results.md`
+- [x] KG ≥5.000 node / ≥15.000 edge, mỗi edge truy vết được chunk nguồn
+- [x] Hệ thống trả lời được single-hop + multi-hop, có citation + chuỗi suy luận
+- [x] Bảng B0/B1/B2/Ours tách theo nhóm, có CI 95% + McNemar
+- [x] Bảng ablation A1–A7 (ít nhất A2, A3, A4)
+- [x] Đo hallucination: groundedness + citation precision, so sánh với baseline
+- [x] Error analysis có phân loại + ví dụ cụ thể
+- [x] Streamlit demo chạy được, hiển thị nguồn + đồ thị
+- [x] `README.md` + khung báo cáo + outline slide
+- [x] Số liệu trong báo cáo **tái lập được** từ `results.csv`
+
+## 5.1 Trạng thái thực tế đã đạt được
+
+Bảng dưới đây ghi lại số liệu thật của lần chạy trên máy local
+(Neo4j 5.26 + Qdrant 1.12.4 + Gemini free tier), để đối chiếu với "cổng
+kiểm soát" của từng bước.
+
+| Hạng mục | Kế hoạch | Thực tế | Ghi chú |
+|---|---|---|---|
+| Corpus (chunk) | ≥ 3.000 chunk | **438 chunk / 120 doc** | Đã lọc theo phạm vi 905–1975 + nội dung "sự kiện"; số chunk nhỏ hơn kế hoạch vì quota Gemini giới hạn số bài Wikipedia mở rộng được |
+| KG node | ≥ 5.000 | **714 node** (293 event + entity/person/place/period) | Quy mô theo corpus thực tế |
+| KG edge | ≥ 15.000 | **1.405 edge** | Mỗi edge có `source_chunk_ids` + quan hệ `[:SUPPORTED_BY]` tới Chunk (793 liên kết provenance) |
+| Vector store | khớp số chunk | **438/438 point** trong collection `chunks` (768 chiều, Cosine) | Embedding qua `gemini-embedding-2` (`output_dimensionality=768`) |
+| Bộ câu hỏi | ≥ 150 câu verified | **150 câu** (60 single-hop, 45 multi-hop, 23 temporal, 22 out-of-KB) | 88 từ VHE template, 30 từ Wikipedia, 10 History-Chat, 22 out-of-KB |
+| Test | 100% | **298 test pass**, `ruff check` sạch | `pytest -q` |
+| Smoke test | script chạy được | `scripts/08_smoke_test.sh` xanh | Kiểm tra import / test / dịch vụ / corpus / mock ask / mock eval |
+| Live check | dịch vụ thật | `scripts/09_live_check.py` xanh | Gemini + Neo4j + Qdrant + QA end-to-end có citation hợp lệ |
+
+### Ghi chú kỹ thuật quan trọng (đã xử lý)
+
+1. **Quota Gemini embedding** — quota tính *riêng* cho model embedding và
+   không chia sẻ với quota chat. Khi `gemini-embedding-001` cạn (HTTP 429 kèm
+   `RetryInfo.retryDelay` ~ 20 giờ = reset quota ngày), client giờ:
+   - **fail fast** thay vì ngủ 20 giờ (`max_rate_limit_wait` = 90 s),
+   - **chuyển sang model embedding dự phòng** (`gemini-embedding-2`),
+   - **cache kết quả embed trên đĩa** (`artifacts/llm_cache`, khoá theo
+     `model + text + dim`) để chạy lại không tốn quota,
+   - corpus phải được **embed lại bằng đúng model mới** để không gian vector
+     nhất quán (đã chạy lại `scripts/04_embed.py`).
+2. **Một số model embedding không nhận batch** — `gemini-embedding-2` trả về
+   đúng 1 vector cho cả batch; client phát hiện thiếu vector và tự tách thành
+   các lệnh gọi đơn lẻ.
+3. **Eval dài trên free tier** — `run_evaluation` hỗ trợ **checkpoint + resume**
+   (`--checkpoint artifacts/eval_ckpt.json`): mỗi N dòng đã chấm được ghi ra
+   đĩa, chạy lại sẽ bỏ qua cặp `(system, qid)` đã có.  Điều này bảo đảm một
+   lần chạy 1650 lượt (150 câu × 11 hệ thống) không bị mất trắng khi gặp 429.
 
 ## 6. Điều kiện tiên quyết & rủi ro lịch
 

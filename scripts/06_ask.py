@@ -30,14 +30,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from hgrag.config import get_settings  # noqa: E402
-from hgrag.kg.alias import AliasResolver  # noqa: E402
 from hgrag.kg.store import InMemoryGraphStore, Neo4jGraphStore  # noqa: E402
-from hgrag.llm.client import MockLLMClient, build_llm_client  # noqa: E402
 from hgrag.qa.pipeline import ABLATION_FLAGS, QAPipeline  # noqa: E402
-from hgrag.retrieval.embeddings import MockEmbedder, build_embedder  # noqa: E402
-from hgrag.retrieval.entity_linker import EntityLinker  # noqa: E402
-from hgrag.retrieval.graph_search import GraphSearcher  # noqa: E402
-from hgrag.retrieval.rerank import build_reranker  # noqa: E402
 from hgrag.retrieval.vector_store import NumpyVectorStore, QdrantVectorStore  # noqa: E402
 
 logger = logging.getLogger("06_ask")
@@ -112,40 +106,9 @@ def build_vector_store(settings: Any, mock: bool) -> Any:
 
 
 def build_pipeline(mock: bool, settings: Any) -> QAPipeline:
-    if mock:
-        llm_client = MockLLMClient(embed_dim=settings.embed_dim, seed=settings.seed)
-        embedder = MockEmbedder(dim=settings.embed_dim)
-    else:
-        llm_client = build_llm_client(settings)
-        embedder = build_embedder(settings, llm_client)
+    from hgrag.qa.pipeline import build_pipeline as _factory
 
-    store = build_store("neo4j", settings)
-    vector_store = build_vector_store(settings, mock)
-    if vector_store is None:
-        vector_store = NumpyVectorStore()
-
-    linker = EntityLinker(
-        resolver=AliasResolver(
-            store=store,
-            llm_client=llm_client,
-            embedder=embedder,
-            settings=settings,
-        ),
-        settings=settings,
-    )
-    searcher = GraphSearcher(store=store, settings=settings, embedder=embedder)
-    reranker = build_reranker(settings, embedder)
-
-    return QAPipeline(
-        llm_client=llm_client,
-        embedder=embedder,
-        graph_store=store,
-        vector_store=vector_store,
-        entity_linker=linker,
-        graph_searcher=searcher,
-        reranker=reranker,
-        settings=settings,
-    )
+    return _factory(settings, mock=mock)
 
 
 def render_text(result: Any, show_evidence: bool, explain: bool) -> str:

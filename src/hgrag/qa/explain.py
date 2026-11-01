@@ -8,8 +8,9 @@ relations were traversed and which nodes/edges make up the final subgraph.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 
 logger = logging.getLogger(__name__)
 

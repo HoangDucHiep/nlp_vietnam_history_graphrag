@@ -162,8 +162,18 @@ Test tự động chặn network (fixture `block_network`); test cần mạng ph
 ## 8. Ghi chú về quota Gemini (free tier)
 
 * Mỗi model Flash có quota ~20 request/ngày → client **xoay model** khi gặp HTTP 429.
-* Embedding có quota theo phút → client **chờ đúng `RetryInfo.retryDelay`** rồi thử lại.
-* Mọi lời gọi LLM được cache đĩa tại `artifacts/llm_cache/` → chạy lại **không tốn quota**.
+* **Quota embedding là độc lập** với quota chat. Khi model embedding chính hết quota,
+  client **fail fast** (không ngủ tới lúc reset ~20 giờ) rồi **chuyển sang model
+  embedding dự phòng** (`gemini-embedding-2`). Khi đó corpus phải được embed lại
+  bằng đúng model mới (`python scripts/04_embed.py`) để không gian vector nhất quán.
+* Mọi lời gọi LLM **và embedding** được cache đĩa tại `artifacts/llm_cache/`
+  (khoá theo nội dung + model) → chạy lại **không tốn quota**.
+* Run đánh giá dài hỗ trợ **checkpoint + resume**:
+  ```bash
+  python scripts/07_run_eval.py --checkpoint artifacts/eval_ckpt.json
+  ```
+  Khi bị 429 giữa chừng, chạy lại lệnh trên sẽ bỏ qua các cặp `(system, qid)`
+  đã chấm xong.
 * Nếu hết quota toàn bộ: hệ thống tự chuyển sang chế độ **mock** (offline) để vẫn demo được.
 
 ## 9. Giấy phép / ghi nhận

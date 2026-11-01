@@ -971,7 +971,7 @@ def render_tab_eval(settings: Any) -> None:
     frame = load_results_table(results_path)
     if frame.empty:
         st.info(
-            f"Chưa có `{results_path}`. Chạy `scripts/06_run_eval.py` để sinh kết quả "
+            f"Chưa có `{results_path}`. Chạy `scripts/07_run_eval.py` để sinh kết quả "
             "(Baseline B0/B1/B2 + Ours + ablation)."
         )
         return
