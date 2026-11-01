@@ -406,18 +406,36 @@ class AliasResolver:
         self._exact_index.clear()
         self._key_index.clear()
         self._qid_index.clear()
+        self.add_to_alias_index(entities)
+
+    def add_to_alias_index(self, entities: Iterable[Any]) -> int:
+        """Add entities to the alias index **without** clearing it.
+
+        Used by the KG builder: the anchor nodes (document subjects) are
+        added on top of the index that was built from the store, so that the
+        mentions extracted from the corpus can be linked to them.
+        """
+        added = 0
         for entity in entities:
             record = self._record_from(entity)
             if record is None:
                 continue
+            # ``Chunk`` nodes are *provenance anchors*, not entities: they
+            # carry the title of the document they come from, so a chunk named
+            # "Trần Hưng Đạo" would shadow the real person node and hijack
+            # every mention.  They are therefore excluded from the index.
+            if record.entity_type == "Chunk":
+                continue
             self.records[record.uid] = record
             self._index_record(record)
+            added += 1
         logger.info(
             "Alias index: %d entities, %d surface keys, %d normalised keys",
             len(self.records),
             len(self._exact_index),
             len(self._key_index),
         )
+        return added
 
     def _record_from(self, entity: Any) -> _Record | None:
         if entity is None:
@@ -668,12 +686,18 @@ class AliasResolver:
                 qid = str(hit.get("id") or "")
                 match_type = str((hit.get("match") or {}).get("type") or "")
                 label = str(hit.get("label") or (hit.get("match") or {}).get("text") or mention)
-                if qid and match_type == "alias":
-                    out.append(
-                        self._candidate_for_qid(
-                            qid, label, 1, mention, "T1: Wikidata wbsearchentities (alias)"
-                        )
+                description = str(hit.get("description") or "")
+                if qid and match_type in ("alias", "label"):
+                    # ``wbsearchentities`` returns ``match.type == "label"``
+                    # when the mention *is* the canonical label of the item --
+                    # an exact-label hit is as strong as a Wikidata alias.
+                    tier = 1 if match_type == "alias" else 1
+                    cand = self._candidate_for_qid(
+                        qid, label, tier, mention, f"T1: Wikidata wbsearchentities ({match_type})"
                     )
+                    if description and not cand.reason:
+                        cand.reason += f" -- {description}"
+                    out.append(cand)
         return out
 
     # ------------------------------------------------------------------
@@ -857,14 +881,9 @@ class AliasResolver:
             return []
         if not query:
             return []
-        scored: list[tuple[float, _Record]] = []
-        for record in self.records.values():
-            text = self._embed_text(record)
-            vector = self._embed(embedder, text)
-            if not vector:
-                continue
-            scored.append((_cosine(query, vector), record))
-        scored.sort(key=lambda item: -item[0])
+        scored = self._score_records(embedder, query)
+        if not scored:
+            return []
         top = [item for item in scored[:10] if item[0] >= self.embedding_min_score]
         if not top:
             return []
@@ -941,6 +960,39 @@ class AliasResolver:
         vector = [float(x) for x in vector]
         self._embed_cache[text] = vector
         return vector
+
+    def _score_records(
+        self, embedder: Any, query: list[float]
+    ) -> list[tuple[float, _Record]]:
+        """Cosine score of every indexed record against ``query``.
+
+        The vectors of the records are embedded **in one batch** the first
+        time they are needed and then cached in memory, so that resolving N
+        mentions costs N + 1 embedding calls instead of N * len(records).
+        """
+        records = list(self.records.values())
+        missing = [
+            r
+            for r in records
+            if self._embed_text(r) not in self._embed_cache
+        ]
+        if missing:
+            texts = [self._embed_text(r) for r in missing]
+            try:
+                vectors = embedder.embed(texts)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("batch embed failed: %s", exc)
+                vectors = []
+            for text, vec in zip(texts, vectors, strict=False):
+                self._embed_cache[text] = [float(x) for x in vec]
+        scored: list[tuple[float, _Record]] = []
+        for record in records:
+            vector = self._embed_cache.get(self._embed_text(record))
+            if not vector:
+                continue
+            scored.append((_cosine(query, vector), record))
+        scored.sort(key=lambda item: -item[0])
+        return scored
 
     @staticmethod
     def _embed_text(record: _Record) -> str:

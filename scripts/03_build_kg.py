@@ -80,6 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="cho phép gọi Wikipedia/Wikidata khi định danh thực thể (chậm hơn)",
     )
+    p.add_argument(
+        "--live",
+        dest="live",
+        action="store_true",
+        help="bật tra cứu trực tiếp Wikipedia/Wikidata cho mỗi mention (rất chậm)",
+    )
     p.add_argument("--verbose", action="store_true", help="bật log DEBUG")
     return p
 
@@ -187,16 +193,29 @@ def main(argv: list[str] | None = None) -> int:
             logger.warning("Không khởi tạo được embedder: %s", exc)
         wikidata = None
         wikipedia = None
-        online = bool(args.online) and not args.offline
-        if online:
+        # The Wikidata client is always created: even in "offline" mode the
+        # anchor seeding needs the P31/P27/alias properties of the 10
+        # documents' QIDs (a single batched request, cached on disk).
+        try:
+            from hgrag.data.wikidata import WikidataClient
+
+            wikidata = WikidataClient(cache_dir=settings.cache_dir)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Không khởi tạo được client Wikidata: %s", exc)
+        # The *live* lookups (Wikipedia redirect + Wikidata search) need one
+        # HTTP request per mention.  During the bulk build there are
+        # thousands of mentions and the Wikimedia API answers 429 long before
+        # the build finishes, so they are opt-in (``--live``).  The alias
+        # index built from the anchors already carries the Wikipedia redirect
+        # titles, so the offline tiers cover the same ground.
+        live = bool(args.live) and not args.offline
+        if live:
             try:
-                from hgrag.data.wikidata import WikidataClient
                 from hgrag.data.wikipedia import WikipediaClient
 
-                wikidata = WikidataClient(cache_dir=settings.cache_dir)
-                wikipedia = WikipediaClient(cache_dir=settings.cache_dir)
+                wikipedia = WikipediaClient(cache_dir=settings.data_raw / "wiki")
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Không khởi tạo được client Wikipedia/Wikidata: %s", exc)
+                logger.warning("Không khởi tạo được client Wikipedia: %s", exc)
         resolver = AliasResolver(
             store=store,
             llm_client=llm_client,
@@ -204,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
             wikidata=wikidata,
             wikipedia=wikipedia,
             settings=settings,
-            offline=not online,
+            offline=not live,
             ontology=ontology,
         )
 
@@ -215,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
         resolver=resolver,
         settings=settings,
         llm_client=llm_client,
+        wikidata=wikidata,
     )
 
     # -- build ----------------------------------------------------------
@@ -229,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
         "mock": bool(args.mock),
         "extract": bool(args.extract),
         "online_resolve": bool(args.online) and not args.offline,
+        "live_resolve": bool(args.live) and not args.offline,
         "ontology": {
             "source": ontology.source,
             "n_event_types": len(ontology.event_types),

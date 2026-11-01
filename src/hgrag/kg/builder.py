@@ -30,6 +30,7 @@ from ..data.records import Chunk, Entity, Relation, stable_uid
 from .alias import AliasResolver
 from .ontology import ONTOLOGY as _DEFAULT_ONTOLOGY
 from .ontology import Ontology, normalize_role, relation_for_role
+from .seed import anchor_relation, seed_entities_from_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,109 @@ ARG_TYPE_TO_ENTITY_TYPE: dict[str, str] = {
 
 #: Argument types that become a *participant* of the event.
 PARTICIPANT_ROLES = ("AGENT", "BENEFICIARY", "EXPERIENCER", "FORCE", "INSTRUMENT")
+
+#: Trigger phrases that carry no information on their own.  An event named
+#: only after such a trigger ("sinh", "mất", "đánh bại") is useless for the
+#: entity linker -- hundreds of them share the same name.  When the trigger
+#: is one of these, the event is renamed after its *agent* instead.
+GENERIC_TRIGGERS: frozenset[str] = frozenset(
+    {
+        "sinh",
+        "mất",
+        "chết",
+        "cưới",
+        "gả",
+        "đánh",
+        "đánh bại",
+        "đánh tan",
+        "đánh đuổi",
+        "đánh dẹp",
+        "đánh phá",
+        "thắng trận",
+        "thua trận",
+        "xây dựng",
+        "lập ra",
+        "thành lập",
+        "giải thể",
+        "chia",
+        "hợp nhất",
+        "ký",
+        "kết",
+        "bắt đầu",
+        "kết thúc",
+        "diễn ra",
+        "tham gia",
+        "chỉ huy",
+        "ra lệnh",
+        "tập kích",
+        "giao",
+        "bị",
+        "được",
+        "mang",
+        "giữ",
+        "giết",
+        "cầu",
+        "dựng",
+        "mở",
+        "đóng",
+        "tổ chức",
+        "di chuyển",
+        "trở lại",
+        "trở về",
+        "rút",
+        "thăm",
+        "dặn",
+        "phong",
+        "phong tặng",
+        "tặng",
+        "ban",
+        "săn",
+        "trồng",
+        "lập",
+        "thành",
+        "giải phóng",
+        "thống nhất",
+        "chia rẽ",
+    }
+)
+
+
+def event_display_name(
+    trigger: str,
+    description: str,
+    agent_name: str,
+    year: int | None,
+) -> str:
+    """A readable, *linkable* name for an event node.
+
+    The raw LLM trigger is often a bare verb ("sinh", "mất"), which makes
+    hundreds of events share the same name and wrecks the entity linking.
+    The rule is:
+
+    * a descriptive trigger (``"lập ra nhà Lý"``) is kept as is;
+    * a generic trigger is combined with the agent -> ``"Lý Công Uẩn sinh"``;
+    * when there is no agent, the description (truncated) is used;
+    * the year is appended when it is known, so that two events of the same
+      type but different years stay distinguishable.
+    """
+    trigger = (trigger or "").strip()
+    description = (description or "").strip()
+    agent = (agent_name or "").strip()
+
+    generic = trigger.casefold() in GENERIC_TRIGGERS or len(trigger) <= 2
+    if generic:
+        if agent:
+            name = f"{agent} {trigger}" if trigger else agent
+        elif description:
+            name = description
+        else:
+            name = trigger or "sự kiện"
+    else:
+        name = trigger
+
+    if year and str(year) not in name:
+        name = f"{name} ({year})"
+    return name[:180].strip()
 
 
 @dataclass
@@ -110,6 +214,7 @@ class KGBuilder:
         resolver: AliasResolver | None = None,
         settings: Any = None,
         llm_client: Any = None,
+        wikidata: Any = None,
     ) -> None:
         self.store = store
         self.ontology = ontology or _DEFAULT_ONTOLOGY
@@ -117,6 +222,7 @@ class KGBuilder:
         self.resolver = resolver
         self.settings = settings
         self.llm_client = llm_client
+        self.wikidata = wikidata
         self._entity_cache: dict[str, Entity] = {}
 
     # ------------------------------------------------------------------
@@ -143,6 +249,24 @@ class KGBuilder:
         chunk_list = list(chunks)
         if max_chunks is not None:
             chunk_list = chunk_list[: max(0, int(max_chunks))]
+
+        # -- anchor nodes -------------------------------------------------
+        # The canonical subject of every document (with its Wikidata QID and
+        # its Wikipedia redirect aliases) is seeded *before* the extraction
+        # so that the resolver can link the extracted mentions to it.
+        anchors = seed_entities_from_chunks(chunk_list, wikidata=self.wikidata)
+        anchor_by_uid = {a.uid: a for a in anchors}
+        for anchor in anchors:
+            entities.setdefault(anchor.uid, anchor)
+        if self.resolver is not None and anchors:
+            try:
+                # Only the anchors that carry a QID are indexed: an anchor
+                # without one would shadow the real entity that has the same
+                # name (e.g. the Wikipedia subject without its QID would hide
+                # the Wikidata-identified person).
+                self.resolver.add_to_alias_index([a for a in anchors if a.wikidata_id])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Không dựng được alias index từ anchor: %s", exc)
 
         for index, chunk in enumerate(chunk_list, start=1):
             stats.n_chunks += 1
@@ -171,6 +295,11 @@ class KGBuilder:
                     chunk.chunk_id,
                     len(events),
                 )
+            # the document subject is linked to its chunk
+            anchor_uid = _anchor_uid_for_chunk(chunk, anchors)
+            if anchor_uid:
+                rel = anchor_relation(chunk, anchor_uid)
+                relations[rel["uid"]] = Relation(**rel)
 
         # write the chunk nodes (provenance anchors)
         if chunk_nodes:
@@ -229,10 +358,19 @@ class KGBuilder:
     ) -> None:
         event_type = event.event_type
         trigger = event.trigger or event_type
-        event_uid = stable_uid(chunk.chunk_id, event_type, trigger, prefix="evt_")
+        agent_name = _agent_name(event.arguments)
+        display_name = event_display_name(
+            trigger, getattr(event, "description", "") or "", agent_name, event.year
+        )
+        # The uid must stay stable across rebuilds *and* must not collide
+        # between two different events that share the same trigger, hence the
+        # agent and the year are part of the key.
+        event_uid = stable_uid(
+            event_type, trigger, agent_name, str(event.year or ""), prefix="evt_"
+        )
         event_entity = Entity(
             uid=event_uid,
-            name=trigger,
+            name=display_name,
             entity_type="Event",
             description=event.description or "",
             year_min=event.year,
@@ -244,6 +382,7 @@ class KGBuilder:
             extra={
                 "event_type": event_type,
                 "trigger": trigger,
+                "agent": agent_name,
                 "doc_id": chunk.doc_id,
                 "title": chunk.title,
             },
@@ -262,7 +401,21 @@ class KGBuilder:
             arg_type = str(arg.get("type") or "Entity")
             entity_type = ARG_TYPE_TO_ENTITY_TYPE.get(arg_type, "Entity")
             arg_entity, linked = self._argument_entity(name, entity_type, chunk, stats)
-            entities[arg_entity.uid] = arg_entity
+            existing = entities.get(arg_entity.uid)
+            if existing is not None:
+                # The node already exists (e.g. it is an anchor node with a
+                # canonical name and its Wikidata aliases): keep the
+                # canonical data and only merge the provenance.
+                for cid in arg_entity.source_chunk_ids:
+                    if cid not in existing.source_chunk_ids:
+                        existing.source_chunk_ids.append(cid)
+                if not existing.wikidata_id and arg_entity.wikidata_id:
+                    existing.wikidata_id = arg_entity.wikidata_id
+                if not existing.description and arg_entity.description:
+                    existing.description = arg_entity.description
+                arg_entity = existing
+            else:
+                entities[arg_entity.uid] = arg_entity
             if linked:
                 stats.n_linked += 1
 
@@ -357,6 +510,12 @@ class KGBuilder:
                 year_min = candidate.year_min
                 year_max = candidate.year_max
                 linked = bool(wikidata_id)
+                # The canonical name of the resolved entity is preferred over
+                # the raw mention ("Trần Quốc Tuấn" -> "Trần Hưng Đạo").
+                if candidate.name and candidate.tier <= 1:
+                    name = candidate.name
+                    if name not in aliases:
+                        aliases.insert(0, name)
 
         if wikidata_id:
             uid = f"pe:{wikidata_id.upper()}"
@@ -416,6 +575,26 @@ def _count(values: Iterable[str]) -> dict[str, int]:
     for value in values:
         out[value] = out.get(value, 0) + 1
     return dict(sorted(out.items()))
+
+
+def _anchor_uid_for_chunk(chunk: Chunk, anchors: Sequence[Entity]) -> str:
+    """The uid of the anchor entity that corresponds to ``chunk``."""
+    for anchor in anchors:
+        if anchor.extra.get("doc_id") == chunk.doc_id:
+            return anchor.uid
+    return ""
+
+
+def _agent_name(arguments: Sequence[Mapping[str, Any]] | None) -> str:
+    """The name of the first ``AGENT`` argument of an event (empty when none)."""
+    for arg in arguments or []:
+        if not isinstance(arg, Mapping):
+            continue
+        if normalize_role(str(arg.get("role") or "")) == "AGENT":
+            name = str(arg.get("name") or "").strip()
+            if name:
+                return name
+    return ""
 
 
 def entities_from_mappings(rows: Sequence[Mapping[str, Any]]) -> list[Entity]:

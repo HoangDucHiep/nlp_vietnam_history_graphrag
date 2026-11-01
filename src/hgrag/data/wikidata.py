@@ -10,7 +10,9 @@ See docs/07 §2 and §5 (tầng T0/T1) for how the returned data is used.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -73,6 +75,34 @@ class WikidataClient:
         self.session.headers.update({"User-Agent": user_agent, "Accept": "application/json"})
         self._last_request = 0.0
 
+    # ------------------------------------------------------------------
+    # disk cache
+    # ------------------------------------------------------------------
+    def _cache_file(self, kind: str, key: str) -> Path | None:
+        if not self.cache_dir:
+            return None
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", key)[:120] or "_"
+        return self.cache_dir / "wikidata" / f"{kind}_{safe}.json"
+
+    def _cache_load(self, kind: str, key: str) -> Any | None:
+        path = self._cache_file(kind, key)
+        if path is None or not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def _cache_save(self, kind: str, key: str, payload: Any) -> None:
+        path = self._cache_file(kind, key)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Cannot write Wikidata cache: %s", exc)
+
     def _throttle(self, delay: float | None = None) -> None:
         gap = self.delay if delay is None else delay
         if gap <= 0:
@@ -86,7 +116,7 @@ class WikidataClient:
         """Perform an API request, retrying on 429/5xx with exponential backoff."""
         if self.offline:
             return {}
-        delay = max(self.delay, 0.5)
+        delay = max(self.delay, 1.5)
         for attempt in range(retries):
             self._throttle(delay)
             try:
@@ -118,7 +148,12 @@ class WikidataClient:
 
     # ------------------------------------------------------------------
     def get_entities(self, qids: Iterable[str]) -> dict[str, dict[str, Any]]:
-        """Fetch entities by QID (batched 50 QIDs per request)."""
+        """Fetch entities by QID (batched 50 QIDs per request).
+
+        The responses are cached on disk (``<cache_dir>/wikidata``) so that a
+        re-run does not hammer the API -- the Wikimedia endpoints answer
+        429 quickly when the request rate is too high.
+        """
         wanted = [q.strip().upper() for q in qids if q and q.strip()]
         # de-duplicate, keep order
         seen: set[str] = set()
@@ -128,8 +163,15 @@ class WikidataClient:
                 seen.add(q)
                 unique.append(q)
         entities: dict[str, dict[str, Any]] = {}
-        for i in range(0, len(unique), BATCH_SIZE):
-            batch = unique[i : i + BATCH_SIZE]
+        pending: list[str] = []
+        for qid in unique:
+            cached = self._cache_load("entity", qid)
+            if isinstance(cached, dict) and cached:
+                entities[qid] = cached
+            else:
+                pending.append(qid)
+        for i in range(0, len(pending), BATCH_SIZE):
+            batch = pending[i : i + BATCH_SIZE]
             params = {
                 "action": "wbgetentities",
                 "format": "json",
@@ -142,6 +184,7 @@ class WikidataClient:
             for qid, payload in got.items():
                 if qid in batch:
                     entities[qid] = payload
+                    self._cache_save("entity", qid, payload)
             missing = [q for q in batch if q not in got]
             if missing:
                 logger.warning("Wikidata: %d entity/entities not found", len(missing))
@@ -152,6 +195,10 @@ class WikidataClient:
         name = (name or "").strip()
         if not name:
             return None
+        cache_key = f"{name}|{language}|{limit}"
+        cached = self._cache_load("search", cache_key)
+        if cached is not None:
+            return cached or None
         params = {
             "action": "wbsearchentities",
             "format": "json",
@@ -164,7 +211,9 @@ class WikidataClient:
         data = self._request(params)
         hits = data.get("search") or []
         if not hits:
+            self._cache_save("search", cache_key, {})
             return None
+        self._cache_save("search", cache_key, hits[0])
         return hits[0]
 
     # ------------------------------------------------------------------
