@@ -78,6 +78,13 @@ _TEMPORAL_CUE_RE = re.compile(
     re.IGNORECASE,
 )
 _YEAR_RE = re.compile(r"\b(\d{3,4})\b")
+_TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase word tokens of ``text`` (used by the lexical fallback)."""
+    return [t.casefold() for t in _TOKEN_RE.findall(text or "")]
+
 
 
 def _extract_years(text: str) -> list[int]:
@@ -266,7 +273,11 @@ class GraphSearcher:
         result.n_expanded = len(raw_paths)
 
         years = list(year_refs) if year_refs is not None else _extract_years(query_text)
-        scored = [self._score_path(p, relation_plan, query_text, years) for p in raw_paths]
+        similarities = self._path_similarities(raw_paths, query_text)
+        scored = [
+            self._score_path(p, relation_plan, query_text, years, similarities.get(i, 0.5))
+            for i, p in enumerate(raw_paths)
+        ]
         scored.sort(key=lambda p: (-p.score, p.hops))
         result.paths = scored[:limit]
         return result
@@ -468,9 +479,11 @@ class GraphSearcher:
         relation_plan: list[str] | None,
         query_text: str,
         year_refs: list[int],
+        similarity: float | None = None,
     ) -> GraphPath:
         affinity = self._relation_affinity(path, relation_plan, query_text)
-        similarity = self._path_similarity(path, query_text)
+        if similarity is None:
+            similarity = self._path_similarity(path, query_text)
         temporal = self._temporal_overlap(path, year_refs)
         penalty = self._degree_penalty(path)
         weights = PATH_SCORE_WEIGHTS
@@ -521,6 +534,55 @@ class GraphSearcher:
             return 0.5
         # embeddings are normalised in practice -> map cosine to [0, 1]
         return max(0.0, min(1.0, _cosine(q_vec, p_vec)))
+
+    def _path_similarities(
+        self, paths: Sequence[GraphPath], query_text: str
+    ) -> dict[int, float]:
+        """Path similarity for *all* paths, computed with a single embedding call.
+
+        Embedding every path individually costs one API request per path --
+        with the free-tier quota of the embedding models that is enough to
+        abort a whole evaluation run.  Here the question and all path texts are
+        embedded in **one** batch, and when the embedder is unavailable (quota
+        exhausted, network down) the scoring degrades gracefully to a
+        lexical token-overlap similarity instead of failing.
+
+        The returned dict maps the *index* of the path in ``paths`` to its
+        similarity score.
+        """
+        if not paths:
+            return {}
+        query = (query_text or "").strip()
+        if not query:
+            return {i: 0.5 for i in range(len(paths))}
+
+        texts = [p.to_text() for p in paths]
+        embedder = self.embedder
+        if embedder is not None:
+            try:
+                vectors = embedder.embed([query, *texts])
+                if vectors and len(vectors) == len(texts) + 1:
+                    q_vec = vectors[0]
+                    out: dict[int, float] = {}
+                    for index, vec in enumerate(vectors[1:]):
+                        out[index] = max(0.0, min(1.0, _cosine(q_vec, vec)))
+                    if out:
+                        return out
+            except Exception as exc:  # noqa: BLE001
+                logger.info(
+                    "Không embed được path (quota?): %s -- dùng điểm từ khoá", exc
+                )
+        # lexical fallback: token overlap between the question and the path
+        query_tokens = set(_tokenize(query))
+        out_lex: dict[int, float] = {}
+        for index, text in enumerate(texts):
+            path_tokens = set(_tokenize(text))
+            if not query_tokens or not path_tokens:
+                out_lex[index] = 0.5
+                continue
+            overlap = len(query_tokens & path_tokens) / len(query_tokens | path_tokens)
+            out_lex[index] = max(0.0, min(1.0, overlap))
+        return out_lex
 
     def _temporal_overlap(self, path: GraphPath, year_refs: list[int]) -> float:
         if not year_refs:

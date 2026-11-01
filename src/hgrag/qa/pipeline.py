@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from ..data.records import Evidence
 from .answer import AnswerGenerator, AnswerResult
@@ -71,6 +72,8 @@ class QAResult:
             "evidence": list(self.evidence),
             "explanation": dict(self.explanation),
             "understanding": dict(self.understanding),
+            "subgraph": dict(self.explanation.get("subgraph") or {}),
+            "grounded": bool(self.citations),
             "refused": self.refused,
             "elapsed": round(float(self.elapsed), 4),
             "system": self.system,
@@ -90,6 +93,7 @@ class QAPipeline:
         graph_searcher: Any = None,
         context_builder: Any = None,
         reranker: Any = None,
+        lexical_index: Any = None,
         settings: Any = None,
     ) -> None:
         from ..config import get_settings
@@ -105,6 +109,7 @@ class QAPipeline:
         self.graph_searcher = graph_searcher
         self.context_builder = context_builder
         self.reranker = reranker
+        self.lexical_index = lexical_index
 
         self.top_k = int(cfg.get("vector_top_k", 30))
         self.rerank_top_k = int(cfg.get("rerank_top_k", 10))
@@ -118,9 +123,18 @@ class QAPipeline:
         self.chunk_collection = str(
             (getattr(self.settings, "qdrant", {}) or {}).get("collection_chunks", "chunks")
         )
+        # The vector collection depends on the *active* embedder: the Gemini
+        # vectors are 768-dim, a local sentence-transformers model is usually
+        # 384-dim.  Mixing them in the same collection would break the search.
+        self._collection_overrides: dict[str, str] = {}
         self._answer_generator: AnswerGenerator | None = None
         self._explainer: Explainer | None = None
         self._understanding_cache: dict[str, QueryUnderstanding] = {}
+
+    def set_chunk_collection(self, name: str) -> None:
+        """Override the Qdrant collection used for the chunk vectors."""
+        if name:
+            self.chunk_collection = str(name)
 
     # ------------------------------------------------------------------
     # public API
@@ -272,12 +286,14 @@ class QAPipeline:
         flags: Mapping[str, bool],
     ) -> list[dict[str, Any]]:
         if self.vector_store is None or self.embedder is None:
-            return []
+            return self._lexical_search(question, top_k, understanding, flags)
         try:
             query_vec = self.embedder.embed_one(question)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Embedding câu hỏi thất bại: %s", exc)
-            return []
+            logger.warning(
+                "Embedding câu hỏi thất bại (%s) -> dùng tìm kiếm từ khoá", exc
+            )
+            return self._lexical_search(question, top_k, understanding, flags)
         filters = self._filters(understanding, flags)
         try:
             hits = self.vector_store.search(
@@ -285,6 +301,30 @@ class QAPipeline:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Vector search thất bại: %s", exc)
+            return self._lexical_search(question, top_k, understanding, flags)
+        if not hits:
+            # Không có kết quả vector -> thử tìm kiếm từ khoá trước khi kết luận.
+            lexical = self._lexical_search(question, top_k, understanding, flags)
+            if lexical:
+                return lexical
+        return list(hits or [])
+
+    def _lexical_search(
+        self,
+        question: str,
+        top_k: int,
+        understanding: QueryUnderstanding,
+        flags: Mapping[str, bool],
+    ) -> list[dict[str, Any]]:
+        """Tìm kiếm từ khoá (BM25) -- dự phòng khi không embed được câu hỏi."""
+        index = self.lexical_index
+        if index is None:
+            return []
+        filters = self._filters(understanding, flags)
+        try:
+            hits = index.search(question, top_k=top_k, filters=filters or None)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Lexical search thất bại: %s", exc)
             return []
         return list(hits or [])
 
@@ -293,7 +333,7 @@ class QAPipeline:
     ) -> dict[str, Any]:
         filters: dict[str, Any] = {}
         if understanding.time_refs and not self._flag(flags, "no_temporal"):
-            filters["year_min"] = understanding.time_refs
+            filters["year_overlap"] = list(understanding.time_refs)
         return filters
 
     def _rerank(
@@ -542,3 +582,114 @@ class QAPipeline:
         )
         result.elapsed = time.perf_counter() - started
         return result
+
+
+# --------------------------------------------------------------------------
+# factory
+# --------------------------------------------------------------------------
+
+
+def build_pipeline(settings: Any = None, mock: bool = False) -> QAPipeline:
+    """Build a fully wired :class:`QAPipeline` from the project settings.
+
+    The Streamlit app and the CLI both use this factory, so the demo and the
+    evaluation harness always run the *same* pipeline.
+    """
+    from ..config import get_settings
+    from ..kg.alias import AliasResolver
+    from ..kg.store import Neo4jGraphStore
+    from ..llm.client import MockLLMClient, build_llm_client
+    from ..retrieval.embeddings import MockEmbedder, build_embedder
+    from ..retrieval.entity_linker import EntityLinker
+    from ..retrieval.graph_search import GraphSearcher
+    from ..retrieval.rerank import build_reranker
+    from ..retrieval.vector_store import NumpyVectorStore, QdrantVectorStore
+
+    settings = settings if settings is not None else get_settings()
+
+    if mock:
+        llm_client = MockLLMClient(embed_dim=settings.embed_dim, seed=settings.seed)
+        embedder = MockEmbedder(dim=settings.embed_dim)
+    else:
+        llm_client = build_llm_client(settings)
+        embedder = build_embedder(settings, llm_client)
+
+    ncfg = settings.neo4j
+    try:
+        store = Neo4jGraphStore(
+            uri=settings.neo4j_uri,
+            user=str(ncfg.get("user", "neo4j")),
+            password=settings.neo4j_password,
+            database=str(ncfg.get("database", "neo4j")),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không kết nối được Neo4j (%s) -> dùng InMemoryGraphStore", exc)
+        from ..kg.store import InMemoryGraphStore
+
+        store = InMemoryGraphStore()
+
+    qcfg = settings.qdrant
+    embed_dim = int(getattr(embedder, "dim", settings.embed_dim) or settings.embed_dim)
+    # The Gemini vectors are 768-dim; a local sentence-transformers model is
+    # 384-dim.  Each embedder therefore uses its *own* collection so that the
+    # query vector always has the same dimension as the stored corpus.
+    is_local = str(getattr(embedder, "name", "")).startswith("local:")
+    if is_local:
+        collection = str(qcfg.get("collection_chunks_local", "chunks_local"))
+    else:
+        collection = str(qcfg.get("collection_chunks", "chunks"))
+    try:
+        vector_store = QdrantVectorStore(
+            url=str(qcfg.get("url", "http://localhost:6333")),
+            vector_size=embed_dim,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không kết nối được Qdrant (%s) -> dùng NumpyVectorStore", exc)
+        vector_store = NumpyVectorStore(vector_size=embed_dim)
+
+    resolver = AliasResolver(
+        store=store,
+        llm_client=llm_client,
+        embedder=embedder,
+        settings=settings,
+    )
+    # The fuzzy tiers (T1 alias, T2 redirect, T4 name_key, T5 embedding) need
+    # the alias index; without it the resolver can only do the exact-name
+    # lookup of tier 0.
+    try:
+        entities = store.list_entities()
+        resolver.build_alias_index(entities)
+        logger.info("Alias index: %d entity", len(entities))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không dựng được alias index: %s", exc)
+
+    linker = EntityLinker(resolver=resolver, settings=settings)
+    searcher = GraphSearcher(store=store, settings=settings, embedder=embedder)
+
+    # Chỉ mục từ khoá: dự phòng khi quota embedding của Gemini cạn.
+    lexical_index = None
+    try:
+        from ..retrieval.lexical import build_lexical_index
+
+        lexical_index = build_lexical_index(
+            corpus_path=settings.data_processed / "corpus.jsonl",
+            cache_path=settings.artifacts / "lexical_index.json",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không dựng được lexical index: %s", exc)
+
+    pipeline = QAPipeline(
+        llm_client=llm_client,
+        embedder=embedder,
+        graph_store=store,
+        vector_store=vector_store,
+        entity_linker=linker,
+        graph_searcher=searcher,
+        reranker=build_reranker(settings, embedder),
+        lexical_index=lexical_index,
+        settings=settings,
+    )
+    pipeline.set_chunk_collection(collection)
+    return pipeline
+
+

@@ -10,14 +10,19 @@ paths:
 
 llm:
   provider: auto            # auto | gemini | openai | mock
-  model: gemini-3.5-flash
-  # Free-tier keys have a per-model daily quota. When the primary model is
-  # exhausted (HTTP 429) the client transparently rotates to these.
+  # Quota theo *ngày* của free tier: khi model chính cạn, client tự chuyển
+  # sang các model dự phòng dưới đây.
+  model: gemini-3.1-flash-lite
   fallback_models:
-    - gemini-3.1-flash-lite
     - gemini-flash-lite-latest
     - gemini-3.8-flash
-  embed_model: gemini-embedding-001
+    - gemini-3.5-flash
+  embed_model: gemini-embedding-2
+  # Quota của model embedding là độc lập với quota chat.  Khi model chính
+  # cạn, client chuyển sang model dự phòng -- khi đó corpus phải được
+  # embed lại bằng đúng model đó để không gian vector còn nhất quán.
+  fallback_embed_models:
+    - gemini-embedding-2-preview
   temperature: 0.0
   max_output_tokens: 2048
   request_timeout: 120
@@ -31,7 +36,11 @@ embedding:
   provider: auto            # auto | gemini | local | mock
   dim: 768
   batch_size: 64
-  local_model: Qwen/Qwen3-Embedding-0.6B
+  # Model embedding *cục bộ* dùng khi quota Gemini cạn (hoặc chạy hoàn toàn
+  # offline).  Mô hình đa ngôn ngữ 384 chiều, chạy tốt trên CPU.
+  local_model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  # Mô hình mạnh hơn, dùng trên Kaggle GPU.
+  local_model_gpu: Qwen/Qwen3-Embedding-0.6B
 
 neo4j:
   uri: bolt://localhost:7687
@@ -45,6 +54,9 @@ neo4j:
 qdrant:
   url: http://localhost:6333
   collection_chunks: chunks
+  # Collection riêng cho vector tạo bởi model embedding *cục bộ* (384 dim).
+  # Cần thiết vì collection `chunks` chứa vector 768 dim của Gemini.
+  collection_chunks_local: chunks_local
   collection_nodes: nodes
   vector_size: 768
   distance: Cosine

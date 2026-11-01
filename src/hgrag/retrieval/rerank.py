@@ -152,13 +152,13 @@ class HeuristicReranker:
             int(m.group(1)) for m in _YEAR_RE.finditer(query or "") if m.group(1)
         }
         idf = self._idf(items)
-        query_vec = self._embed(query)
+        query_vec, cand_vecs = self._embed_pair(query, items)
 
         scored: list[dict[str, Any]] = []
-        for item in items:
+        for index, item in enumerate(items):
             text = _candidate_text(item)
             tokens = _tokens(text)
-            similarity = self._similarity(query_vec, text)
+            similarity = self._similarity(query_vec, cand_vecs, index)
             keyword = self._keyword_overlap(query_tokens, tokens, idf)
             temporal = self._temporal(text, query_years)
             penalty = self._length_penalty(text)
@@ -192,13 +192,40 @@ class HeuristicReranker:
             logger.debug("embed failed: %s", exc)
             return None
 
-    def _similarity(self, query_vec: list[float] | None, text: str) -> float:
-        if query_vec is None:
+    def _embed_pair(
+        self, query: str, items: Sequence[Mapping[str, Any]]
+    ) -> tuple[list[float] | None, list[list[float]]]:
+        """Embed the query and every candidate in **one** batched call.
+
+        Embedding the candidates one by one costs one API request per
+        candidate (30 per question), which exhausts the free-tier embedding
+        quota after a handful of questions.  When the embedder is unavailable
+        the reranker keeps working -- the ``similarity`` signal is then 0 and
+        the BM25-ish keyword overlap carries the ranking.
+        """
+        embedder = self.embedder
+        if embedder is None or not (query or "").strip():
+            return None, []
+        texts = [query, *[_candidate_text(i) for i in items]]
+        try:
+            vectors = list(embedder.embed(texts))
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Không embed được candidate (%s) -> bỏ qua similarity", exc)
+            return None, []
+        if not vectors or len(vectors) != len(texts):
+            logger.info("Embed trả về %d/%d vector -> bỏ qua similarity", len(vectors), len(texts))
+            return None, []
+        return list(vectors[0]), [list(v) for v in vectors[1:]]
+
+    def _similarity(
+        self,
+        query_vec: list[float] | None,
+        cand_vecs: Sequence[Sequence[float]],
+        index: int,
+    ) -> float:
+        if query_vec is None or index >= len(cand_vecs):
             return 0.0
-        vec = self._embed(text)
-        if not vec:
-            return 0.0
-        return max(0.0, min(1.0, _cosine(query_vec, vec)))
+        return max(0.0, min(1.0, _cosine(query_vec, cand_vecs[index])))
 
     @staticmethod
     def _idf(items: Sequence[Mapping[str, Any]]) -> dict[str, float]:

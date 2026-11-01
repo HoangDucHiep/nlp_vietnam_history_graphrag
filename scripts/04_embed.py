@@ -67,6 +67,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("qdrant", "numpy"),
         help="backend vector store (default: qdrant)",
     )
+    p.add_argument(
+        "--embedder",
+        type=str,
+        default="auto",
+        choices=("auto", "gemini", "local", "mock"),
+        help="nguồn embedding (auto: Gemini, fallback local khi hết quota)",
+    )
     p.add_argument("--limit", type=int, default=None, help="giới hạn số chunk xử lý")
     p.add_argument("--out", type=str, default=None, help="ghi stats ra file JSON")
     p.add_argument("--mock", action="store_true", help="dùng MockEmbedder (offline)")
@@ -155,9 +162,27 @@ def main(argv: list[str] | None = None) -> int:
     dim = int(args.dim or settings.embed_dim)
     if args.mock:
         embedder: Any = MockEmbedder(dim=dim, seed=settings.seed)
-    else:
+    elif args.embedder == "mock":
+        embedder = MockEmbedder(dim=dim, seed=settings.seed)
+    elif args.embedder == "local":
+        from hgrag.retrieval.embeddings import LocalEmbedder
+
+        embedder = LocalEmbedder(str(settings.embedding.get("local_model", "")))
+    elif args.embedder == "gemini":
+        from hgrag.llm.client import build_llm_client
+        from hgrag.retrieval.embeddings import LLMEmbedder
+
+        embedder = LLMEmbedder(build_llm_client(settings))
+    else:  # auto
         embedder = build_embedder(settings)
-        dim = int(getattr(embedder, "dim", dim))
+    dim = int(getattr(embedder, "dim", dim) or dim)
+
+    # Mỗi embedder có một collection riêng: vector Gemini 768 chiều không
+    # thể nằm chung collection với vector cục bộ 384 chiều.
+    if args.collection == DEFAULT_COLLECTION and str(getattr(embedder, "name", "")).startswith(
+        "local:"
+    ):
+        args.collection = str(settings.qdrant.get("collection_chunks_local", "chunks_local"))
 
     store = make_store(args.store, settings, dim)
     try:

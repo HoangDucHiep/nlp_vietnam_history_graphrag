@@ -43,7 +43,12 @@ class LLMEmbedder:
 
 
 class LocalEmbedder:
-    """sentence-transformers backend (used on Kaggle GPU)."""
+    """sentence-transformers backend (used on Kaggle GPU, or as an offline fallback).
+
+    The model is loaded lazily and its dimension is read from the model
+    itself, so the same code path works for a 384-dim multilingual MiniLM
+    (CPU) and a 1024-dim Qwen3-Embedding (GPU).
+    """
 
     def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B", device: str | None = None):
         from sentence_transformers import SentenceTransformer  # lazy import
@@ -114,7 +119,20 @@ class MockEmbedder:
 
 
 def build_embedder(settings: Any | None = None, client: Any | None = None) -> Embedder:
-    """Pick the best available embedder for the environment."""
+    """Pick the best available embedder for the environment.
+
+    Order of preference:
+
+    1. ``mock``   -- deterministic offline stub (tests, CI);
+    2. ``local``  -- a sentence-transformers model (offline fallback, no quota);
+    3. ``gemini`` -- the hosted embedding model (best quality, but the free
+       tier has a *daily* quota that is easy to exhaust);
+    4. ``auto``   -- Gemini first, then a **local** model, then the mock.
+
+    The local fallback matters: when the Gemini embedding quota is exhausted
+    the pipeline must still be able to embed the query, otherwise the vector
+    search silently degrades to zero hits and the system refuses to answer.
+    """
     if settings is None:
         from ..config import get_settings
 
@@ -124,11 +142,11 @@ def build_embedder(settings: Any | None = None, client: Any | None = None) -> Em
     if provider == "mock":
         return MockEmbedder(dim=settings.embed_dim, seed=settings.seed)
 
-    if provider in ("local", "auto") and provider == "local":
-        try:
-            return LocalEmbedder(settings.embedding.get("local_model", ""))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Không dùng được local embedder (%s) -> fallback", exc)
+    if provider == "local":
+        embedder = _try_local(settings)
+        if embedder is not None:
+            return embedder
+        return MockEmbedder(dim=settings.embed_dim, seed=settings.seed)
 
     if provider in ("gemini", "auto") and settings.has_gemini_key:
         if client is None:
@@ -136,6 +154,47 @@ def build_embedder(settings: Any | None = None, client: Any | None = None) -> Em
 
             client = build_llm_client(settings)
         if getattr(client, "name", "") == "gemini":
+            if provider == "gemini":
+                return LLMEmbedder(client)
+            # provider == "auto": Gemini is preferred, but a local model is
+            # used when the Gemini *embedding* quota is exhausted.
+            if _gemini_embedding_available(client):
+                return LLMEmbedder(client)
+            logger.warning(
+                "Quota embedding của Gemini đã cạn -> dùng model embedding cục bộ"
+            )
+            embedder = _try_local(settings)
+            if embedder is not None:
+                return embedder
             return LLMEmbedder(client)
 
+    embedder = _try_local(settings)
+    if embedder is not None:
+        return embedder
     return MockEmbedder(dim=settings.embed_dim, seed=settings.seed)
+
+
+def _try_local(settings: Any) -> Embedder | None:
+    """Build the local embedder, or return ``None`` when it is unavailable."""
+    model_name = str(settings.embedding.get("local_model", "") or "")
+    if not model_name:
+        return None
+    try:
+        return LocalEmbedder(model_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không dùng được local embedder %r (%s)", model_name, exc)
+        return None
+
+
+def _gemini_embedding_available(client: Any) -> bool:
+    """Whether the Gemini embedding endpoint still has quota left.
+
+    A single tiny embedding request is enough to detect the daily-quota
+    exhaustion (``HTTP 429``) of the free tier without spending real quota.
+    """
+    try:
+        vectors = client.embed(["ping"])
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Embedding Gemini không khả dụng: %s", str(exc)[:160])
+        return False
+    return bool(vectors)

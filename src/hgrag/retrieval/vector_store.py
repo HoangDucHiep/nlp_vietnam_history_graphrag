@@ -32,18 +32,49 @@ class VectorStore(Protocol):
 
 
 def _qdrant_filter(filters: dict[str, Any] | None) -> Any:
-    """Translate a simple flat filter dict into a Qdrant filter."""
+    """Translate a simple flat filter dict into a Qdrant filter.
+
+    Besides the plain equality/``MatchAny`` semantics, two *special* keys are
+    understood:
+
+    ``year_overlap``
+        a list of years; a chunk matches when its ``[year_min, year_max]``
+        range overlaps one of them (a chunk without any year never matches).
+    """
     if not filters:
         return None
-    from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+    from qdrant_client.models import (
+        FieldCondition,
+        Filter,
+        MatchAny,
+        MatchValue,
+        MinShould,
+        Range,
+    )
 
     must = []
     for key, value in filters.items():
+        if key == "year_overlap":
+            years = [int(y) for y in (value or [])]
+            if not years:
+                continue
+            clauses = []
+            for year in years:
+                clauses.append(
+                    Filter(
+                        must=[
+                            FieldCondition(key="year_min", range=Range(lte=year)),
+                            FieldCondition(key="year_max", range=Range(gte=year)),
+                        ]
+                    )
+                )
+            must.append(Filter(should=clauses, min_should=MinShould(min_should=1)))
+            continue
         if isinstance(value, (list, tuple, set)):
             must.append(FieldCondition(key=key, match=MatchAny(any=list(value))))
         else:
             must.append(FieldCondition(key=key, match=MatchValue(value=value)))
-    return Filter(must=must)
+    return Filter(must=must) if must else None
 
 
 class QdrantVectorStore:
