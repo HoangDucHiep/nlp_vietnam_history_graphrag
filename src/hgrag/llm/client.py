@@ -669,6 +669,16 @@ class GeminiClient(LLMClient):
                             resp = self._client.models.generate_content(**kwargs)
                             text = getattr(resp, "text", "") or ""
                             usage = getattr(resp, "usage_metadata", None)
+                    if not text.strip() and model_name is not models_to_try[-1]:
+                        # Body rỗng *sau khi* đã thử lại với ngân sách lớn hơn
+                        # (ví dụ `FinishReason.RECITATION` của Gemma 4): thử
+                        # model dự phòng thay vì trả về câu rỗng cho pipeline.
+                        logger.warning(
+                            "Mô hình %s vẫn trả về câu rỗng (%s) -- chuyển model khác",
+                            model_name,
+                            self._empty_reason(resp),
+                        )
+                        break
                     payload = {
                         "text": text,
                         "model": model_name,
