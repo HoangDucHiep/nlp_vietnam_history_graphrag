@@ -256,6 +256,34 @@ def _score_row(
     return row
 
 
+def _run_config(pipeline: Any) -> dict[str, Any]:
+    """The configuration of a run, embedded into the report for transparency."""
+    config: dict[str, Any] = {}
+    settings = getattr(pipeline, "settings", None)
+    if settings is not None:
+        config["llm_model"] = getattr(settings, "llm_model", "")
+        config["embed_model"] = getattr(settings, "embed_model", "")
+        retrieval = dict(getattr(settings, "retrieval", {}) or {})
+        config["rerank_backend"] = retrieval.get("rerank_backend", "")
+        config["vector_top_k"] = retrieval.get("vector_top_k", "")
+        config["graph_max_hops"] = retrieval.get("graph_max_hops", "")
+        config["context_max_tokens"] = retrieval.get("context_max_tokens", "")
+        config["max_evidence"] = retrieval.get("max_evidence", "")
+    reranker = getattr(pipeline, "reranker", None)
+    if reranker is not None:
+        config["reranker"] = type(reranker).__name__
+    embedder = getattr(pipeline, "embedder", None)
+    if embedder is not None:
+        config["embedder"] = str(getattr(embedder, "name", "") or type(embedder).__name__)
+    collections = getattr(pipeline, "chunk_collections", None)
+    if collections:
+        config["collections"] = ", ".join(str(c) for c in collections)
+    judge = getattr(pipeline, "llm_client", None)
+    if judge is not None:
+        config["judge"] = "LLM judge (Gemini)"
+    return {k: v for k, v in config.items() if v not in ("", None)}
+
+
 def run_evaluation(
     pipeline: Any,
     dataset: EvalDataset | Sequence[EvalQuestion],
@@ -281,7 +309,13 @@ def run_evaluation(
         questions = questions[: int(limit)]
 
     judge = judge or build_judge(getattr(pipeline, "llm_client", None))
-    run = EvalRun(meta={"n_questions": len(questions), "systems": list(systems)})
+    run = EvalRun(
+        meta={
+            "n_questions": len(questions),
+            "systems": list(systems),
+            "config": _run_config(pipeline),
+        }
+    )
 
     plan: list[tuple[str, dict[str, bool]]] = [(s, {}) for s in systems]
     if ablations:

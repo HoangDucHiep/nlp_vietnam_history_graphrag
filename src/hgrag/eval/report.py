@@ -289,6 +289,23 @@ def write_results_markdown(
         f"- Số hệ thống: **{len({r.system for r in run.rows})}**",
         f"- Tổng số lượt chấm: **{len(run.rows)}**",
         "",
+        "## 0. Cấu hình lượt chạy",
+        "",
+    ]
+    config = meta.get("config") or {}
+    if config:
+        parts += [
+            "| Tham số | Giá trị |",
+            "|---|---|",
+        ]
+        for key, value in config.items():
+            parts.append(f"| {key} | {value} |")
+        parts.append("")
+    parts += [
+        "> Các số liệu dưới đây được sinh tự động từ `artifacts/eval_run.json` "
+        "bằng `scripts/07_run_eval.py`; có thể tái lập bằng "
+        "`python scripts/07_run_eval.py`.",
+        "",
         "## 1. Bảng chính (baseline vs Ours)",
         "",
         _main_table(run),
