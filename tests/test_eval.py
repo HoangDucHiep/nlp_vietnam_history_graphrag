@@ -619,6 +619,28 @@ def test_llm_judge_vary_the_task_on_retry() -> None:
     assert client.tasks == ["judge_answer"]
 
 
+# --------------------------------------------------------------------------
+# report formatting
+# --------------------------------------------------------------------------
+
+
+def test_fmt_signed_makes_the_direction_of_a_difference_explicit() -> None:
+    """Bảng Δ phải chỉ rõ dấu.
+
+    Không có dấu thì ``0.080`` trong cột "Δ so với Ours" bị đọc nhầm thành
+    "Ours tốt hơn 8 %" trong khi nó có nghĩa là "ablation này **tốt hơn** Ours
+    8 %".
+    """
+    from hgrag.eval.report import _fmt, _fmt_signed
+
+    assert _fmt_signed(0.08) == "+0.080"
+    assert _fmt_signed(-0.08) == "-0.080"
+    assert _fmt_signed(0.0) == "+0.000"
+    assert _fmt_signed(None) == "–"
+    # Giá trị không có dấu vẫn giữ nguyên hành vi cũ.
+    assert _fmt(0.08) == "0.080"
+
+
 def test_build_judge_picks_heuristic_without_client() -> None:
     assert isinstance(build_judge(None), HeuristicJudge)
     assert isinstance(build_judge(object(), mock=True), HeuristicJudge)
