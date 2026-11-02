@@ -112,7 +112,8 @@ vietnam_history_graphrag/
 │   └── app/       streamlit_app.py
 ├── scripts/       00_up.sh 00_down.sh 01_ingest.py 03_build_kg.py 04_embed.py
 │                  05_eval_dataset.py 06_ask.py 07_run_eval.py 08_smoke_test.sh
-│                  09_live_check.py 10_validate_eval_paths.py 11_fix_eval_paths.py run_all.sh
+│                  09_live_check.py 10_validate_eval_paths.py 11_fix_eval_paths.py
+│                  13_prune_empty_cache.py 14_rejudge_degraded.py run_all.sh
 ├── tests/         test_data.py test_llm.py test_kg.py test_retrieval.py test_qa.py test_eval.py test_app.py
 ├── data/          raw/ processed/
 ├── artifacts/     llm_cache/ extractions/ *.json
@@ -198,6 +199,26 @@ Quota free tier của Google AI Studio **không chỉ giới hạn số request*
   trường rubric đã viết trọn vẹn. Nếu vẫn không được, dòng đó được đánh dấu
   `judge_degraded` và **báo cáo cảnh báo rõ ràng** thay vì trộn điểm heuristic
   với điểm LLM.
+* **Verdict của judge được kiểm tra ở mức mệnh đề, không phải chuỗi con.**
+  Bộ lọc cũ tìm chuỗi khen (`"đúng về nghĩa"`, `"trả lời đúng"`) trên cả lý do
+  nên loại oan các lý do *chê* và các lý do có mệnh đề khen bị từ nối đảo chiều
+  vô hiệu hoá; dòng đó rơi về heuristic token-F1 — một heuristic **chặt hơn**
+  rubric — nên đáp án đúng bị báo cáo là sai.  Bộ lọc mới nhận diện từ phủ định
+  (`không`, `chưa`, `sai`) đứng trước và từ nối đảo chiều (`nhưng`, `tuy nhiên`).
+  Đo trên 1.198 verdict thật: bản cũ loại 51 (31 loại oan), bản mới loại 20 (0
+  loại oan).  Chi tiết: [docs/10 §6](docs/10_quota_gemini_free_tier.md).
+* **Lần chấm lại của judge phải đổi prompt.** Với `temperature=0` cùng một
+  prompt luôn cho cùng một kết quả, nên chỉ đổi cache key khiến cả ba lần thử
+  trả về đúng ba payload giống hệt nhau.  Lần chấm lại nay kèm
+  `JUDGE_RETRY_HINT` (chấm `score` trước, viết `reason` khớp với điểm).
+* **Đường đi trong đồ thị được kể lại bằng câu tiếng Việt.** Chuỗi trừu tượng
+  `A -ABOUT-> B` khiến LLM đọc như danh sách nhãn quan hệ và từ chối trả lời;
+  `GraphPath.to_natural_text()` kèm câu VHE gốc trong `Nguồn: ...` giúp hệ
+  thống dùng được đúng câu trả lời nằm trong kho (docs/03 §5.1.3).
+* **Thực thể VHE được chuẩn hoá theo mention, không theo vai trò.** `vhe_entity_uid`
+  không còn trộn `entity_type` vào khoá hash, nên một mention xuất hiện ở nhiều vai
+  trò (nguồn/đề tài) chỉ còn một node → điều hướng hai chiều agent ↔ theme
+  liền mạch (docs/03 §5.1.2).
 * Mọi lời gọi LLM **và embedding** được cache đĩa tại `artifacts/llm_cache/`
   (khoá theo nội dung **+ model**, nên đổi model không dùng lại kết quả của
   model cũ) → chạy lại **không tốn quota**.
@@ -214,6 +235,7 @@ Kiểm tra lại hạn mức và đường giãn nhịp:
 ```bash
 python scripts/validate_pacing.py pacing 24 6   # không được có 429
 python scripts/validate_pacing.py judge         # verdict phải từ LLM, không heuristic
+python scripts/14_rejudge_degraded.py --in-place  # chấm lại dòng judge_degraded
 ```
 
 ## 9. Giấy phép / ghi nhận

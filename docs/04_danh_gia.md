@@ -270,3 +270,23 @@ quota vô ích) **và** các hệ thống ablation bị chạy với cấu hình
 > `scripts/12_merge_eval.py` đếm số dòng thiếu và số dòng bị degrade trước
 > khi sinh báo cáo.
 
+### 7.2 Bốn lỗi phát hiện ở lượt chạy thứ hai
+
+Lượt chạy thứ hai (sau khi dựng lại đồ thị VHE) vẫn còn hai lỗi, lần này nằm ở
+**tầng truy xuất** và ở **bộ chấm điểm**:
+
+| # | Triệu chứng | Nguyên nhân gốc | Cách sửa |
+|---|---|---|---|
+| **4** | **42 % câu VHE template bị từ chối** dù đáp án vàng nằm trong kho | (a) `vhe_entity_uid` trộn `entity_type` vào khoá hash ⇒ cùng một mention ở hai vai trò tách thành hai node, traversal từ theme không chạm tới event của agent; (b) đường đi được dựng thành chuỗi trừu tượng `A -ABOUT-> B` nên LLM đọc như danh sách nhãn và từ chối | `vhe_entity_uid` bỏ `entity_type` khỏi khoá hash (mọi mention gộp về một node chuẩn); `GraphPath.to_natural_text()` kể lại đường đi bằng câu tiếng Việt kèm câu VHE gốc (`extra.evidence_text`) (docs/03 §5.1.2–§5.1.3) |
+| **5** | Dòng `vhe_00001` trả lời **đúng** nhưng báo cáo ghi **sai** (`judge_degraded = true`) | (a) bộ lọc `_is_self_consistent` tìm chuỗi khen trên cả `reason` nên loại oan lý do *chê*; (b) lần chấm lại chỉ đổi cache key, mà `temperature=0` khiến cả ba lần thử trả về payload giống hệt nhau | Bộ lọc làm việc trên **từng mệnh đề** (nhận diện từ phủ định và từ nối đảo chiều); lần chấm lại **đổi prompt** (`JUDGE_RETRY_HINT`) (docs/10 §6) |
+
+Lưu ý quan trọng về lỗi #5: bộ lọc "loại verdict mâu thuẫn" chỉ an toàn khi
+heuristic dự phòng **không chặt hơn** rubric.  Ở đây heuristic token-F1 đòi
+F1 ≥ 0.75 mới coi là đúng, trong khi rubric LLM chấm theo *ngữ nghĩa* ⇒ rơi về
+heuristic đồng nghĩa với việc báo cáo sai một đáp án đúng.  Đo trên 1 198
+verdict thật: bản cũ loại 51 verdict (31 loại oan), bản mới loại 20 (0 loại oan).
+
+`scripts/14_rejudge_degraded.py` cho phép chấm lại các dòng bị degrade mà
+không phải chạy lại toàn bộ đánh giá (câu trả lời đã cache nên không tốn
+quota sinh đáp án).
+
