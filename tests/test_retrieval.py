@@ -26,6 +26,7 @@ from hgrag.retrieval.entity_linker import (
 from hgrag.retrieval.fusion import (
     apply_diversity_cap,
     apply_temporal_boost,
+    dedupe_by_text,
     fuse,
     reciprocal_rank_fusion,
 )
@@ -570,6 +571,48 @@ def test_apply_diversity_cap() -> None:
     doc_a = [i for i in capped if i["payload"]["doc_id"] == "docA"]
     assert len(doc_a) == 3
     assert any(i["id"] == "other" for i in capped)
+
+
+def test_diversity_cap_does_not_evict_the_graph_paths() -> None:
+    """Đường đi đồ thị không có ``doc_id`` nên không được dồn chung một nhóm.
+
+    Trước đây mọi đường đi đồ thị rơi vào nhóm ``"__nodoc__"`` chung, nên với
+    ``max_per_doc=3`` chỉ ba đường đi đầu tiên lọt vào context dù traversal
+    tìm ra nhiều hơn (đo trên ``vhe_00013``).
+    """
+    paths = [
+        {
+            "id": f"g{i}",
+            "rrf_score": 0.2 - i * 0.001,
+            "payload": {
+                "kind": "graph_path",
+                "text": f"Nhà Tần - ABOUT -> Quận {i}",
+                "path": {"nodes": [{"uid": f"u{i}", "name": f"N{i}"}]},
+            },
+        }
+        for i in range(6)
+    ]
+    capped = apply_diversity_cap(paths, max_per_doc=3)
+    assert len(capped) == 6
+
+
+def test_dedupe_by_text_drops_identical_items() -> None:
+    """Hai đường đi render giống nhau chỉ nên chiếm một chỗ trong context."""
+    items = [
+        {"id": "g1", "rrf_score": 0.2, "payload": {"text": "Nhà Tần - ABOUT -> giải thể"}},
+        {"id": "g2", "rrf_score": 0.19, "payload": {"text": "Nhà Tần - ABOUT -> giải thể"}},
+        {"id": "g3", "rrf_score": 0.18, "payload": {"text": "Nhà Tần - ABOUT -> Nam Hải"}},
+    ]
+    deduped = dedupe_by_text(items)
+    assert [i["id"] for i in deduped] == ["g1", "g3"]
+
+
+def test_dedupe_by_text_ignores_whitespace_differences() -> None:
+    items = [
+        {"id": "g1", "rrf_score": 0.2, "payload": {"text": "Nhà Tần  -  ABOUT -> giải thể"}},
+        {"id": "g2", "rrf_score": 0.19, "payload": {"text": "Nhà Tần - ABOUT -> giải thể"}},
+    ]
+    assert len(dedupe_by_text(items)) == 1
 
 
 def test_fuse_combines_vector_and_graph(small_graph: InMemoryGraphStore) -> None:
