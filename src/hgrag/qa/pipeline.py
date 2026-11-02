@@ -823,38 +823,57 @@ def _resolve_corpus(
         names = local_collections if is_local else gemini_collections
         return embedder, embed_dim, list(names)
 
-    corpus_dim = _dim_of(local_found or gemini_found)
-    is_local_embedder = str(getattr(embedder, "name", "")).startswith("local:")
-    wants_local = corpus_dim is not None and corpus_dim <= 512
+    local_dim = _dim_of(local_found)
+    gemini_dim = _dim_of(gemini_found)
+    embedder_name = str(getattr(embedder, "name", "") or "")
+    is_mock = embedder_name == "mock"
 
-    if wants_local != is_local_embedder:
+    # Ưu tiên nhóm collection có **cùng số chiều** với embedder hiện tại --
+    # đó là điều kiện cần và đủ để tìm kiếm vector được.
+    if embed_dim and local_dim == embed_dim:
+        chosen, chosen_dim = local_found, local_dim
+    elif embed_dim and gemini_dim == embed_dim:
+        chosen, chosen_dim = gemini_found, gemini_dim
+    elif is_mock:
+        # Embedder giả (offline/test): không đổi embedder, dùng nhóm 768 chiều.
+        chosen, chosen_dim = (
+            (gemini_found, gemini_dim) if gemini_found else (local_found, local_dim)
+        )
+    else:
+        # Không nhóm nào khớp -> chọn nhóm đông điểm hơn và đổi embedder cho
+        # khớp với nó (xem phần chuyển embedder bên dưới).
+        if local_found and (not gemini_found or (local_dim or 0) <= (gemini_dim or 0)):
+            chosen, chosen_dim = local_found, local_dim
+        else:
+            chosen, chosen_dim = gemini_found, gemini_dim
+
+    if chosen_dim and embed_dim and chosen_dim != embed_dim:
         logger.warning(
             "Corpus trong Qdrant dùng vector %d chiều nhưng embedder hiện tại là %r "
             "-- chuyển sang embedder phù hợp",
-            corpus_dim or 0,
-            getattr(embedder, "name", "?"),
+            chosen_dim,
+            embedder_name or "?",
         )
-        if wants_local:
+        if chosen_dim <= 512:
             model_name = str(settings.embedding.get("local_model", "") or "")
             try:
                 embedder = LocalEmbedder(model_name)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Không dùng được local embedder %r (%s)", model_name, exc)
-                embedder = MockEmbedder(dim=corpus_dim or embed_dim, seed=settings.seed)
+                embedder = MockEmbedder(dim=chosen_dim, seed=settings.seed)
         else:
             from ..llm.client import build_llm_client
             from ..retrieval.embeddings import LLMEmbedder
 
             embedder = LLMEmbedder(build_llm_client(settings))
-        embed_dim = int(getattr(embedder, "dim", corpus_dim or embed_dim) or embed_dim)
+        embed_dim = int(getattr(embedder, "dim", chosen_dim) or chosen_dim)
 
-    collections = list(local_found if wants_local else gemini_found)
     logger.info(
         "Vector search dùng %d collection: %s (dim=%d)",
-        len(collections),
-        ", ".join(collections),
+        len(chosen),
+        ", ".join(chosen),
         embed_dim,
     )
-    return embedder, embed_dim, collections
+    return embedder, embed_dim, list(chosen)
 
 
