@@ -6,7 +6,10 @@
 # four processes together stay below the free-tier limit.
 #
 # Each worker handles a disjoint set of systems so that no (system, qid) pair
-# is produced twice.
+# is produced twice.  Because ``--systems`` is given explicitly, the seven
+# ablations are NOT added automatically (see scripts/07_run_eval.py): the
+# ablation systems are listed explicitly and each of them really disables the
+# corresponding component of the pipeline.
 #
 # The embedder is pinned to the *local* sentence-transformers model: the
 # Gemini embedding quota of the free tier is exhausted (1000 requests/day),

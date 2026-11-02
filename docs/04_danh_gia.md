@@ -71,6 +71,13 @@ Giao diện Streamlit có tab **"Duyệt câu hỏi"**: hiển thị câu hỏi 
 | D. Out-of-KB (viết tay) | 22 | chấm theo **hành vi** (§2.1.1) |
 | **Tổng** | **150** | 60 single-hop · 45 multi-hop · 23 temporal · 22 out-of-KB |
 
+> **Lưu ý về `gold_chunk_ids` của nhóm VHE (88 câu)**: các câu hỏi template
+> được sinh từ *quan hệ trong đồ thị*, nên câu trả lời nằm trong **câu VHE**
+> chứ không nằm trong chunk Wikipedia.  Vì vậy `gold_chunk_ids` của nhóm này
+> **rỗng**, và theo quy tắc "applicable" (§3.3) chúng **không tính vào mẫu số**
+> của `chunk_recall_at_10` / `ndcg_at_10`.  Ở nhóm này, chỉ số truy xuất có ý
+> nghĩa là **path hit rate** và **entity recall**.
+
 **Gold path đã được kiểm chứng lại với KG thật**:
 
 ```bash
@@ -234,6 +241,24 @@ hạn của Google AI Studio.  Bốn điểm đã được xử lý trong mã ng
 | **429 làm chậm toàn bộ lượt chạy** | Client cũ *ngủ* đúng số giây API yêu cầu rồi thử lại **cùng** model | Client giờ **xoay vòng sang model khác** (mỗi model có hạn mức RPM riêng) và **giãn nhịp chủ động** theo hạn mức `model_rpm` |
 | **Nhiều worker vượt hạn mức chung** | Hạn mức RPM tính **theo project + model**, tức là *dùng chung* cho mọi tiến trình | `hgrag.llm.rate_limit.SharedRateLimiter` — mỗi worker gọi `flock` trên cùng một file nên tổng số request/phút vẫn nằm trong hạn mức |
 | **Judge rơi về heuristic mà không báo** | Khi LLM judge không gọi được, `HeuristicJudge` (token-F1) được dùng thay và **không ai biết** — 722/1 075 dòng bị chấm sai kiểu | `JudgeResult.degraded` / `EvalRow.judge_degraded` được gắn cờ, đếm trong `EvalRun.meta.n_degraded` và **cảnh báo ngay trong `reports/results.md`** |
+
+### 7.1 Ba lỗi phát hiện được ở lượt chạy đầu tiên
+
+Lượt chạy đầu tiên (150 câu × 11 hệ thống) không cho kết quả dùng được, và
+nguyên nhân **không nằm ở LLM** mà ở ba lỗi của hệ thống:
+
+| # | Triệu chứng | Nguyên nhân gốc | Cách sửa |
+|---|---|---|---|
+| **1** | **98/150 câu B0 rỗng**, độ trễ 45–90 s/câu | Gemma 4 dùng *toàn bộ* `max_output_tokens` cho kênh suy luận rồi trả `finish_reason=MAX_TOKENS` với body rỗng | Chuyển B0 sang **JSON mode** (`response_schema` → API tắt thinking) + bộ phát hiện lặp `is_degenerate()` (docs/03 §7) |
+| **2** | **60+ câu VHE có 0 đường đi** trong KG | Traversal chỉ đi theo chiều xuôi, trong khi cạnh `ABOUT` nối theme ← event ← agent | Thêm `_event_hub_rows()` đảo chiều các cạnh hub (docs/03 §5.1.1) |
+| **3** | `InMemoryGraphStore` và `Neo4jGraphStore` **không thống nhất** về hướng cạnh | `InMemoryGraphStore.neighbors()` hoán đổi `src`/`dst` khi `uid == rel["dst"]` → `src == dst`, mất quan hệ đi vào | Cả hai backend trả **đúng hướng thật** của quan hệ (docs/03 §5.0) |
+
+Ngoài ra còn một lỗi ở **harness** (không phải ở pipeline): khi `--systems` được
+chỉ định rõ, `run_evaluation()` vẫn tự thêm cả 7 hệ thống ablation → mỗi
+worker của `launch_eval.sh` chạy lại toàn bộ ablation (4 lần số câu hỏi bị đốt
+quota vô ích) **và** các hệ thống ablation bị chạy với cấu hình đầy đủ nên
+**bảng ablation không đo đúng thứ nó nêu**. Đã sửa ở `src/hgrag/eval/run_eval.py`
+(`_answer_system`/`plan`) và `scripts/07_run_eval.py` (`--with-ablations`).
 
 > **Quy tắc bất di bất dịch của thiết kế đánh giá**: cùng LLM, cùng prompt,
 > cùng corpus cho mọi hệ thống.  Vì vậy khoá cache của LLM client chứa cả

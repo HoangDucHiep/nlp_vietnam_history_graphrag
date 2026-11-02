@@ -1,7 +1,8 @@
 # GraphRAG Hỏi đáp Lịch sử Việt Nam — Tổng quan đồ án
 
-> Trạng thái: **tài liệu thiết kế (draft để thảo luận)** — chưa triển khai code.
-> Cập nhật: 2026-11-01
+> Trạng thái: **đã triển khai** — mã nguồn trong `src/hgrag/`, kết quả đánh giá
+> trong `reports/`. Tài liệu này mô tả bài toán và thiết kế.
+> Cập nhật: 2026-11-02
 
 ## 1. Bối cảnh và vấn đề
 
@@ -102,6 +103,7 @@ Chi tiết từng thành phần: [`02_kien_truc.md`](02_kien_truc.md) · Thuật
 | [`05_ke_hoach_thuc_hien.md`](05_ke_hoach_thuc_hien.md) | Lộ trình triển khai, phân công, ngân sách thời gian, thứ tự cắt |
 | [`06_quyet_dinh_thiet_ke.md`](06_quyet_dinh_thiet_ke.md) | Nhật ký quyết định thiết kế (ADR) + **các câu hỏi còn đang thảo luận** |
 | [`07_xac_dinh_thuc_the.md`](07_xac_dinh_thuc_the.md) | **Định danh thực thể**: giải quyết tên nhập nhằng (Trần Hưng Đạo / Hưng Đạo Vương / Trần Quốc Tuấn…), chiến lược 5 tầng, đã kiểm chứng bằng API thật |
+| [`10_quota_gemini_free_tier.md`](10_quota_gemini_free_tier.md) | **Hạn mức free tier của Google AI Studio**: đo đạc thực nghiệm, vì sao limiter phải tính theo *token/phút*, và cách giữ cho lượt đánh giá không bị rơi về chấm heuristic |
 
 ## 8. Câu hỏi cần thảo luận (xem [`06_quyet_dinh_thiet_ke.md`](06_quyet_dinh_thiet_ke.md))
 

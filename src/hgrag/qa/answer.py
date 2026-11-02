@@ -7,11 +7,14 @@ insufficient the model is instructed to refuse instead of hallucinating.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
+
+from ..llm.client import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +43,73 @@ _REASONING_HEADINGS = (
 )
 
 _STEP_RE = re.compile(r"^\s*(?:\d+[.)]|[-*])\s+(.*\S)\s*$")
+
+#: A word of the Vietnamese text (used by the repetition detector).
+_WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+#: The exact refusal sentence the pipeline uses everywhere.
+REFUSAL_ANSWER = (
+    "Tôi không tìm thấy đủ thông tin trong kho kiến thức để trả lời câu hỏi này."
+)
+
+
+def is_degenerate(text: str, min_words: int = 12) -> bool:
+    """Whether ``text`` is a degenerate (repetitive) model output.
+
+    Gemma 4 sometimes falls into a repetition loop when it is pushed into a
+    narrow output format: it repeats a word ("phất phất phất ..."), a phrase
+    ("theo truyền thuyết, theo truyền thuyết, ...") or a whole sentence
+    until the budget is exhausted.  Such an output is *not* an answer -- it
+    would be graded as a hallucination by the judge, so it must be detected
+    and replaced by an honest refusal.
+
+    Three signals are used:
+
+    * the same **word** repeated at least 6 times in a row;
+    * the same **n-gram** (2 to 5 words) repeated at least 4 times;
+    * the same **line** repeated at least 3 times.
+
+    >>> is_degenerate("phất phất phất phất phất phất")
+    True
+    >>> is_degenerate("Trần Hưng Đạo chỉ huy quân tại trận Bạch Đằng năm 1285.")
+    False
+    """
+    body = (text or "").strip()
+    if not body:
+        return False
+    words = [w.casefold() for w in _WORD_RE.findall(body)]
+    # (1) the same word repeated in a row
+    run = 1
+    for index in range(1, len(words)):
+        if words[index] == words[index - 1]:
+            run += 1
+            if run >= 6:
+                return True
+        else:
+            run = 1
+    # (2) the same n-gram repeated
+    if len(words) >= min_words:
+        for size in (5, 4, 3, 2):
+            if len(words) < size * 4:
+                continue
+            # The shorter the n-gram, the more repetitions are needed: a
+            # two-word repetition happens naturally in a list of citations.
+            threshold = 4 if size >= 4 else 5
+            counts: dict[tuple[str, ...], int] = {}
+            for index in range(len(words) - size + 1):
+                gram = tuple(words[index : index + size])
+                counts[gram] = counts.get(gram, 0) + 1
+                if counts[gram] >= threshold:
+                    return True
+    # (3) the same line repeated
+    lines = [line.strip().casefold() for line in body.splitlines() if line.strip()]
+    if lines:
+        line_counts: dict[str, int] = {}
+        for line in lines:
+            line_counts[line] = line_counts.get(line, 0) + 1
+            if line_counts[line] >= 3:
+                return True
+    return False
 
 
 SYSTEM_PROMPT = """Bạn là chuyên gia lịch sử Việt Nam, trả lời câu hỏi dựa TRÊN DUY NHẤT ngữ cảnh được cung cấp.
@@ -84,6 +154,37 @@ Quy tắc bắt buộc:
 4. KHÔNG suy luận dài, KHÔNG tự hỏi lại người dùng. Chỉ viết câu trả lời cuối cùng.
 5. Kết thúc bằng một mục "## Suy luận" gồm các bước suy luận đánh số (1., 2., 3.) ngắn gọn.
 """
+
+#: Prompt **JSON mode** của baseline B0.  Được dùng thay cho
+#: :data:`CLOSED_BOOK_SYSTEM_PROMPT` khi client hỗ trợ ``response_schema``:
+#: khi có schema thì API tắt hoàn toàn kênh suy luận
+#: (``thoughts_token_count: null``) nên **không bao giờ** rơi vào
+#: ``MAX_TOKENS`` với câu trả lời rỗng -- đây chính là nguyên nhân 98/150
+#: câu B0 rỗng trong lượt đánh giá trước.  Đo đạc: docs/10 §2.
+#:
+#: Hai ràng buộc đo được từ đoạc đạc: (a) ``answer`` tối đa 4 câu -- câu dài
+#: làm mô hình rơi vào lặp; và (b) ``reasoning_steps`` gồm đúng 3 bước ngắn,
+#: mỗi bước là **một** câu tiếng Việt độc lập -- mô hình hay sao chép cụm từ
+#: của câu hỏi vào bước suy luận khi không bị ràng buộc.
+CLOSED_BOOK_JSON_SYSTEM_PROMPT = """Bạn là chuyên gia lịch sử Việt Nam. Bạn trả lời câu hỏi dựa trên KIẾN THỨC CỦA CHÍNH BẠN (closed-book), không có tài liệu tham chiếu nào được cung cấp.
+
+Quy tắc bắt buộc:
+1. `answer`: trả lời trực tiếp, súc tích, bằng tiếng Việt, đúng mốc thời gian và địa danh. Tối đa 4 câu.
+2. KHÔNG gắn trích dẫn [E#] vì không có nguồn nào được cung cấp.
+3. Nếu bạn KHÔNG CHẮC CHẮN hoặc không biết, `answer` phải đúng câu: "Tôi không tìm thấy đủ thông tin trong kho kiến thức để trả lời câu hỏi này." Đây là một câu trả lời HỢP LỆ, không phải lỗi.
+4. `reasoning_steps`: đúng 3 bước, mỗi bước là MỘT CÂU TIẾNG VIỆT ngắn (tối đa 20 từ), không sao chép văn bản, không viết tiếng Anh, không giải thích quy trình nội bộ.
+5. KHÔNG tự hỏi lại người dùng.
+"""
+
+#: Schema JSON của baseline B0 (xem :data:`CLOSED_BOOK_JSON_SYSTEM_PROMPT`).
+CLOSED_BOOK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "reasoning_steps": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["answer"],
+}
 
 CLOSED_BOOK_USER_TEMPLATE = """CÂU HỎI: {question}
 
@@ -250,16 +351,81 @@ class AnswerGenerator:
         thức tham số.  Vì không có nguồn, đáp án không mang trích dẫn ``[E#]``
         và không thể bị chấm "grounded" -- chấm điểm groundedness chỉ áp dụng
         cho các hệ thống có truy xuất (xem ``grounded_applicable``).
+
+        **Vì sao dùng JSON mode?**  Gemma 4 chạy một kênh suy luận riêng và
+        tính token của kênh đó vào ``max_output_tokens``.  Với câu hỏi
+        closed-book mà mô hình *không biết*, kênh suy luận cứ quay vòng tìm
+        kiến thức tham số cho tới khi hết ngân sách, khiến API trả về
+        ``finish_reason=MAX_TOKENS`` với **câu trả lời rỗng** (đo đạc:
+        ``scripts/_probe_closedbook_cause.py``; 98/150 câu B0 của lượt đánh
+        giá trước rơi vào tình huống này).  Khi dùng ``response_schema`` thì
+        API **tắt hoàn toàn** kênh suy luận (``thoughts_token_count: null``)
+        và lời gọi luôn kết thúc trong 3–9 giây.
+
+        Vì vậy baseline B0 dùng JSON mode, và:
+        * nếu client không hỗ trợ schema -> fallback sang prompt văn bản thuần;
+        * nếu JSON hỏng -> fallback sang prompt văn bản thuần;
+        * nếu câu trả lời **lặp** (degenerate) -> coi như không có câu trả lời
+          và trả lời bằng câu từ chối chuẩn.
         """
         if self.llm_client is None:
+            return AnswerResult(answer=REFUSAL_ANSWER, refused=True)
+
+        from ..llm.schemas import LLMMessage, LLMRequest
+
+        user = CLOSED_BOOK_USER_TEMPLATE.format(question=question.strip())
+
+        # -- 1) JSON mode (tắt thinking -> luôn kết thúc) ------------------
+        json_request = LLMRequest(
+            messages=[
+                LLMMessage(role="system", content=CLOSED_BOOK_JSON_SYSTEM_PROMPT),
+                LLMMessage(role="user", content=user),
+            ],
+            task="answer_closed_book",
+            temperature=0.0,
+            response_schema=dict(CLOSED_BOOK_SCHEMA),
+        )
+        raw = ""
+        try:
+            raw = self.llm_client.generate(json_request).text
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Sinh câu trả lời closed-book (JSON) thất bại: %s", exc)
+            raw = ""
+
+        answer_text, chain = self._parse_closed_book_json(raw)
+        if answer_text and not is_degenerate(answer_text):
             return AnswerResult(
-                answer=(
-                    "Tôi không tìm thấy đủ thông tin trong kho kiến thức để trả lời "
-                    "câu hỏi này."
-                ),
-                refused=True,
+                answer=answer_text.strip(),
+                citations=[],
+                used_evidence_ids=[],
+                invalid_citations=[],
+                refused=is_refusal(answer_text),
+                reasoning_chain=chain,
+                raw_response=raw,
             )
 
+        if raw.strip():
+            # The JSON was unusable (broken or degenerate): fall back to the
+            # plain-text prompt, which is slower but sometimes works.
+            logger.info("Closed-book JSON không dùng được -> thử prompt văn bản")
+            answer_text, chain = self._generate_closed_book_text(question)
+            if answer_text and not is_degenerate(answer_text):
+                return AnswerResult(
+                    answer=answer_text.strip(),
+                    citations=[],
+                    used_evidence_ids=[],
+                    invalid_citations=[],
+                    refused=is_refusal(answer_text),
+                    reasoning_chain=chain,
+                    raw_response=raw,
+                )
+
+        logger.info("Closed-book không sinh được câu trả lời -> từ chối")
+        return AnswerResult(answer=REFUSAL_ANSWER, refused=True)
+
+    # ------------------------------------------------------------------
+    def _generate_closed_book_text(self, question: str) -> tuple[str, list[str]]:
+        """The plain-text fallback of the closed-book baseline."""
         from ..llm.schemas import LLMMessage, LLMRequest
 
         request = LLMRequest(
@@ -270,7 +436,7 @@ class AnswerGenerator:
                     content=CLOSED_BOOK_USER_TEMPLATE.format(question=question.strip()),
                 ),
             ],
-            task="answer_closed_book",
+            task="answer_closed_book_text",
             temperature=0.0,
         )
         raw = ""
@@ -279,27 +445,39 @@ class AnswerGenerator:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Sinh câu trả lời closed-book thất bại: %s", exc)
             raw = ""
-
         if not raw.strip():
-            return AnswerResult(
-                answer=(
-                    "Tôi không tìm thấy đủ thông tin trong kho kiến thức để trả lời "
-                    "câu hỏi này."
-                ),
-                refused=True,
-            )
-
+            return "", []
         answer_text = self._strip_reasoning(raw)
         chain = parse_reasoning_chain(raw) or parse_reasoning_chain(answer_text)
-        return AnswerResult(
-            answer=answer_text.strip(),
-            citations=[],
-            used_evidence_ids=[],
-            invalid_citations=[],
-            refused=is_refusal(answer_text),
-            reasoning_chain=chain,
-            raw_response=raw,
-        )
+        return answer_text.strip(), chain
+
+    @staticmethod
+    def _parse_closed_book_json(raw: str) -> tuple[str, list[str]]:
+        """Parse the JSON payload of the closed-book baseline.
+
+        Returns ``(answer, reasoning_chain)``.  The answer keeps the
+        ``## Suy luận`` block so that the downstream parsing (and the UI)
+        sees the same shape as the other systems.
+        """
+        if not (raw or "").strip():
+            return "", []
+        payload: Any = None
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            # The model sometimes wraps the JSON in prose or a markdown fence.
+            repaired = LLMClient._extract_json(raw)
+            if repaired is not None:
+                try:
+                    payload = json.loads(repaired)
+                except json.JSONDecodeError:
+                    payload = None
+        if not isinstance(payload, dict):
+            return "", []
+        answer = str(payload.get("answer") or "").strip()
+        steps = payload.get("reasoning_steps") or []
+        chain = [str(step).strip() for step in steps if str(step).strip()]
+        return answer, chain
 
     # ------------------------------------------------------------------
     @staticmethod

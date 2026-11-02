@@ -89,6 +89,25 @@ Tầng chuẩn hoá (tên gọi trong `kg/alias.py`), từ rẻ → đắt, dừ
 
 ## 5. Truy xuất đồ thị (phần lõi)
 
+### 5.0 Hướng của cạnh: quy ước bắt buộc
+
+`GraphStore.neighbors()` trả về **các cạnh *tiếp giáp* với node** (theo cả hai
+chiều), nhưng `src`/`dst` **luôn mô tả đúng hướng thật của quan hệ** — chúng
+không bao giờ bị hoán đổi để cho `uid` luôn là nguồn. Nhờ vậy phía trên
+(`retrieval/graph_search.py`) phân biệt được cạnh *đi vào* với cạnh *đi ra*:
+
+| Backend | Cơ chế |
+|---|---|
+| `Neo4jGraphStore` | `MATCH (a)-[r]-(b)` + `WITH startNode(r) AS s, endNode(r) AS e` → `src = s`, `dst = e` |
+| `InMemoryGraphStore` | `rel["src"]` / `rel["dst"]` nguyên vẹn |
+
+> **Lỗi đã sửa (2026-11-02)**: bản `InMemoryGraphStore` cũ gán
+> `dst = entities[other]` với `other = rel["src"]` khi `uid == rel["dst"]`, khiến
+> `src == dst` và **mất toàn bộ quan hệ đi vào**. Hậu quả: hai backend không
+> thống nhất về hướng cạnh và traversal kiểu "event hub" (mục 5.1.1) không
+> dựng được trên bộ nhớ. Test `tests/test_retrieval.py::test_graph_searcher_theme_path_direction`
+> chốt lại quy ước này.
+
 ### 5.1 Truy vấn Cypher
 
 ```cypher
@@ -103,6 +122,46 @@ Traversal **có hướng** (`-[r]->-`) được thực hiện từng bước tro
 2. giữ lại cạnh có `rel_type` nằm trong `relation_plan` (nếu có) — cạnh ngoài kế hoạch vẫn được phép nhưng bị chấm điểm thấp ở bước 5.2;
 3. dừng ở `graph_max_hops = 3` (cap cứng), tối đa `graph_max_paths_per_hop = 30` path mỗi bước;
 4. chống "hub": node có bậc quá cao bị loại khỏi việc mở rộng tiếp (`_degree_penalty`).
+
+### 5.1.1 Đi ngược qua "event hub" (bắt buộc với câu hỏi neo vào theme)
+
+KG mô hình sự kiện là **node riêng**:
+
+```
+agent -[PARTICIPATED_IN]-> event -[ABOUT]-> theme
+                        └-[LOCATED_IN]-> place
+```
+
+Câu hỏi dạng VHE thường neo vào **theme** ("Ai là người thành lập Văn Lang?")
+nhưng đáp án là **agent** của sự kiện `ABOUT` theme đó. Vì cạnh `ABOUT` đi theo
+hướng ngược lại (theme ← event ← agent), một traversal chỉ đi theo chiều xuôi
+**không bao giờ rời được node theme** — đó là lý do **60+ câu VHE có 0 đường đi**
+trong lượt đánh giá đầu tiên.
+
+`GraphSearcher._event_hub_rows()` giải quyết việc này: nó lấy các cạnh **đi vào**
+node hiện tại thuộc nhóm quan hệ hub
+
+\[
+\text{BIDIRECTIONAL} = \{\text{ABOUT, LOCATED\_IN, OCCURRED\_IN, OCCURRED\_AT, HAPPENED\_AT}\} \cup \{\text{PARTICIPATED\_IN, AGENT\_OF, INVOLVES}\}
+\]
+
+rồi **đảo chiều** chúng (`theme → event`, `event → agent`) để traversal đi tiếp
+được theo chiều xuôi. Cạnh đảo giữ nguyên thuộc tính của cạnh gốc — đặc biệt
+`source_chunk_ids`, tức là câu VHE mà sự kiện được trích xuất từ.
+
+Quan hệ `SUPPORTED_BY` **không** bị đảo: nó là quan hệ *provenance*, không phải
+quan hệ *suy luận*.
+
+Cơ chế này được kiểm chứng bằng `scripts/validate_fixes.py`:
+
+| Câu hỏi | Số path | `path_hit` |
+|---|---|---|
+| `vhe_00001` "Ai là người sinh ra Đế Nghi?" | 13 | ✓ |
+| `vhe_00004` "Ai là người sinh ra Lạc Long Quân?" | 20 | ✓ |
+| `vhe_00006` "Ai là người thành lập Văn Lang?" | 20 | ✓ |
+| `vhe_00007` "Trong sự kiện do Hùng Vương thực hiện…" | 1 | ✗ (thiếu node sự kiện trong KG) |
+
+Trước khi sửa: `path_hit = 0/6`; sau khi sửa: `path_hit = 5/8`.
 
 ### 5.2 Chấm điểm đường đi
 
@@ -155,6 +214,28 @@ Bạn là chuyên gia lịch sử Việt Nam, trả lời câu hỏi dựa TRÊN
 4. Trả về kèm `used_evidence` (đã lọc theo citation thực sự dùng) và `subgraph` (node/edge được dùng) để UI vẽ.
 
 **Baseline B0 (closed-book)** dùng prompt riêng (`CLOSED_BOOK_SYSTEM_PROMPT`): không CONTEXT, không citation, trả lời bằng kiến thức tham số của mô hình → đây là baseline "LLM-only" mà docs/04 §4.1 yêu cầu.
+
+> **B0 phải dùng JSON mode — không dùng prompt văn bản thuần.**
+> Gemma 4 chạy một *kênh suy luận* riêng và tính token của kênh đó vào
+> `max_output_tokens`.  Với câu hỏi closed-book mà mô hình **không biết**,
+> kênh suy luận cứ quay vòng tìm kiến thức tham số cho tới khi hết ngân sách →
+> API trả `finish_reason=MAX_TOKENS` với **câu trả lời rỗng**; lượt đánh giá
+> đầu tiên vì thế có **98/150 câu B0 rỗng** (và độ trễ 45–90 s/câu).
+>
+> Khi dùng `response_schema` thì Gemini API **tắt hoàn toàn** kênh suy luận
+> (`thoughts_token_count: null`) và lời gọi kết thúc trong **2.9–9 s**.
+> Đo đạc: `scripts/_probe_thinking.py`, `scripts/_probe_prompt_variants.py`,
+> `docs/10_quota_gemini_free_tier.md`.
+>
+> Vì vậy `generate_closed_book()` gọi JSON mode (`CLOSED_BOOK_SCHEMA`) với
+> fallback theo thứ tự: (1) JSON mode → (2) nếu JSON hỏng **hoặc lặp** thì
+> prompt văn bản thuần → (3) nếu vẫn lặp (`is_degenerate()`) thì trả câu từ
+> chối chuẩn. Bộ phát hiện lặp (`is_degenerate`) bắt ba dạng: cùng một từ lặp
+> ≥ 6 lần, cùng một n-gram (2–5 từ) lặp ≥ 4–5 lần, cùng một dòng lặp ≥ 3 lần.
+>
+> Số liệu đo được sau khi sửa (8 câu đầu, `scripts/validate_fixes.py`):
+> `canned = 3/8`, `refused = 3/8`, độ trễ trung bình **8.3 s** (trước đây
+> 88.9 s với 98/150 câu rỗng).
 
 **Sinh chuỗi suy luận** cho multi-hop: phần `## Suy luận` do mô hình sinh **kèm citation** từ evidence đã cung cấp (chính là các `graph_path` evidence) → đảm bảo "chuỗi liên kết logic" có nguồn thật, không phải LLM tự bịa.
 

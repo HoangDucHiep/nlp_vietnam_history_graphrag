@@ -331,9 +331,18 @@ def run_evaluation(
         }
     )
 
-    plan: list[tuple[str, dict[str, bool]]] = [(s, {}) for s in systems]
+    plan: list[tuple[str, dict[str, bool]]] = []
+    for system in systems:
+        # A system named after an ablation (``A1_no_entity_linking``) must
+        # actually *disable* the corresponding component -- otherwise it is
+        # just a copy of the full pipeline and the ablation table is
+        # meaningless.
+        flag = ABLATIONS.get(system)
+        plan.append((system, {flag: True} if flag else {}))
     if ablations:
-        plan += [(name, {flag: True}) for name, flag in ABLATIONS.items()]
+        plan += [
+            (name, {flag: True}) for name, flag in ABLATIONS.items() if name not in systems
+        ]
 
     done_keys: set[tuple[str, str]] = set()
     if skip_existing and checkpoint_path:

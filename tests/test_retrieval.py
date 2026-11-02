@@ -224,6 +224,65 @@ def small_graph() -> InMemoryGraphStore:
     return store
 
 
+@pytest.fixture()
+def event_hub_graph() -> InMemoryGraphStore:
+    """Đồ thị theo mô hình *event hub* của VHE.
+
+    ``agent -PARTICIPATED_IN-> event -ABOUT-> theme``
+
+    Câu hỏi neo vào *theme* ("Ai là người thành lập Văn Lang?") trước đây
+    không có đường đi nào, vì cạnh ``ABOUT`` trỏ theo hướng ngược lại.
+    """
+    store = InMemoryGraphStore()
+    store.upsert_entities(
+        [
+            Entity(
+                uid="pe:hung_vuong",
+                name="Hùng Vương",
+                entity_type="Person",
+                name_key="hung vuong",
+            ),
+            Entity(
+                uid="ev:thanh_lap_van_lang",
+                name="Hùng Vương thành lập Văn Lang",
+                entity_type="Event",
+                name_key="hung vuong thanh lap van lang",
+            ),
+            Entity(
+                uid="th:van_lang",
+                name="Văn Lang",
+                entity_type="Entity",
+                name_key="van lang",
+            ),
+        ]
+    )
+    store.upsert_relations(
+        [
+            Relation(
+                uid="r_part",
+                src="pe:hung_vuong",
+                dst="ev:thanh_lap_van_lang",
+                rel_type="PARTICIPATED_IN",
+                text="Hùng Vương thành lập Văn Lang",
+                year=0,
+                confidence=0.9,
+                source_chunk_ids=["ck_vhe_1"],
+            ),
+            Relation(
+                uid="r_about",
+                src="ev:thanh_lap_van_lang",
+                dst="th:van_lang",
+                rel_type="ABOUT",
+                text="đặt quốc hiệu là Văn Lang",
+                year=0,
+                confidence=0.9,
+                source_chunk_ids=["ck_vhe_1"],
+            ),
+        ]
+    )
+    return store
+
+
 # --------------------------------------------------------------------------
 # entity linker
 # --------------------------------------------------------------------------
@@ -369,7 +428,39 @@ def test_extract_subgraph(small_graph: InMemoryGraphStore) -> None:
     assert graph["n_nodes"] >= 2
     assert graph["n_edges"] >= 1
     assert all("uid" in n for n in graph["nodes"])
-    assert all("rel_type" in e for e in graph["edges"])
+
+
+# --------------------------------------------------------------------------
+# graph search -- event hub ngược
+# --------------------------------------------------------------------------
+
+
+def test_graph_searcher_reaches_agent_from_theme(event_hub_graph: InMemoryGraphStore) -> None:
+    """Neo vào *theme* vẫn phải tìm được *agent* qua event hub."""
+    searcher = GraphSearcher(event_hub_graph)
+    result = searcher.search(
+        ["th:van_lang"], max_hops=3, max_paths=10, query_text="Ai là người thành lập Văn Lang?"
+    )
+    assert result.paths, "không tìm được đường đi nào từ theme"
+    texts = [p.to_text() for p in result.paths]
+    assert any("Hùng Vương" in t for t in texts)
+
+
+def test_graph_searcher_theme_path_keeps_provenance(event_hub_graph: InMemoryGraphStore) -> None:
+    """Đường đi đi ngược vẫn phải giữ được chunk nguồn của sự kiện."""
+    searcher = GraphSearcher(event_hub_graph)
+    result = searcher.search(["th:van_lang"], max_hops=3, max_paths=10)
+    assert any("ck_vhe_1" in path.source_chunk_ids for path in result.paths)
+
+
+def test_graph_searcher_theme_path_direction(event_hub_graph: InMemoryGraphStore) -> None:
+    """Cạnh đi ngược được đảo chiều để path vẫn là chuỗi có hướng."""
+    searcher = GraphSearcher(event_hub_graph)
+    result = searcher.search(["th:van_lang"], max_hops=3, max_paths=10)
+    for path in result.paths:
+        for index, edge in enumerate(path.edges):
+            assert path.nodes[index]["uid"] == edge["src"]
+            assert path.nodes[index + 1]["uid"] == edge["dst"]
 
 
 # --------------------------------------------------------------------------

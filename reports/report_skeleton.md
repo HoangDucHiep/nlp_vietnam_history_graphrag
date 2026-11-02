@@ -106,14 +106,32 @@ ngân sách 6 000 token.
 
 ## 5. Thiết lập thực nghiệm
 
-* **Mô hình sinh**: `gemini-flash-lite-latest` (xoay sang `gemini-3.5-flash`, `gemini-3.8-flash`, `gemini-3.1-flash-lite` khi hết quota).
+* **Mô hình sinh**: `gemma-4-26b-a4b-it` (quota free tier bền vững: 16 000 *input
+  token/phút*; các model Gemini Flash chỉ có 20–500 request/*ngày* và đã cạn
+  trong lượt chạy này). Chi tiết đo đạc: [`docs/10_quota_gemini_free_tier.md`](../docs/10_quota_gemini_free_tier.md).
 * **Embedding**: quota Gemini đã cạn → dùng model **cục bộ** `paraphrase-multilingual-MiniLM-L12-v2` (384 chiều) cho cả corpus VHE và corpus Wikipedia (`chunks_local`, `chunks_vhe_local`).
 * **Rerank**: `bge-reranker-v2-m3` quá chậm trên CPU (~35 s/lần gọi) → `rerank_backend: auto` tự chuyển sang `HeuristicReranker` (BM25 + boost thời gian + cosine). *Đây là hạn chế của môi trường đánh giá và được nêu rõ trong phần phân tích.*
 * **Kho**: Neo4j 5.26 + Qdrant 1.12.4.
 * **Cố định**: cùng LLM, cùng prompt, cùng corpus cho mọi hệ thống → khác biệt do kiến trúc.
 * **Bộ câu hỏi**: 150 câu / 4 nhóm (chi tiết `docs/04_danh_gia.md`).
-* **Judge**: Gemini, rubric 0–2 + grounded + supported evidence ids; câu out-of-KB chấm theo **hành vi** (từ chối = đúng).
+* **Judge**: Gemma, rubric 0–2 + grounded + supported evidence ids; câu out-of-KB chấm theo **hành vi** (từ chối = đúng).
 * **Tái lập**: `bash scripts/run_all.sh` (seed cố định `42`).
+
+### 5.1 Giới hạn của môi trường đánh giá
+
+Các hạn chế dưới đây là của **máy đánh giá** (CPU, free tier), không phải của
+thiết kế hệ thống, và được nêu rõ để người đọc không hiểu nhầm:
+
+| Hạn chế | Ảnh hưởng | Cách xử lý |
+|---|---|---|
+| Quota Gemini theo *ngày* | Không thể chạy 11 hệ thống × 150 câu bằng Gemini Flash | Dùng Gemma (hạn mức theo *phút*) + limiter token dùng chung giữa 4 worker |
+| Không có GPU | `bge-reranker-v2-m3` quá chậm (~35 s/lần gọi) | `rerank_backend: auto` → heuristic reranker (BM25 + boost thời gian + cosine) |
+| Quota embedding Gemini cạn | Không embed được câu hỏi bằng Gemini | Model embedding **cục bộ** 384 chiều; corpus được embed lại bằng đúng model đó |
+| Corpus Wikipedia còn nhỏ (438 chunk) | Ảnh hưởng độ phủ của bài toán | Đã ghi nhận trong `docs/01_phan_tich_du_lieu.md` |
+
+Nhờ các hạn chế này mà **mọi hệ thống dùng chung một bộ cấu hình** (cùng LLM,
+cùng embedder, cùng reranker, cùng corpus) ⇒ phép so sánh giữa các hệ thống
+vẫn công bằng; chỉ là **độ trần tuyệt đối** của điểm số bị giới hạn.
 
 ## 6. Kết quả
 

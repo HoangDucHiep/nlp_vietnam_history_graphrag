@@ -70,6 +70,50 @@ TEMPORAL_RELATIONS: frozenset[str] = frozenset(
 #: backbone of a reasoning chain.
 PROVENANCE_RELATIONS: frozenset[str] = frozenset({"SUPPORTED_BY"})
 
+#: Relations whose edge points **from an event to its argument**:
+#:
+#: ``event -ABOUT-> theme``, ``event -LOCATED_IN-> place``, ...
+#:
+#: The VHE knowledge graph models an event as a node of its own, so the
+#: question "Ai là người thành lập Văn Lang?" links the *theme* while the
+#: answer is the *agent* of the event.  The two are connected through the
+#: event hub:
+#:
+#: ``theme <-[ABOUT]- event <-[PARTICIPATED_IN]- agent``
+#:
+#: A traversal that only follows the forward direction of the edges can never
+#: leave the theme, because the ``ABOUT`` edge points the other way.  These
+#: relations are therefore traversed in **both** directions around the event
+#: node.  See :meth:`GraphSearcher._event_hub_rows`.
+EVENT_TO_ARGUMENT_RELATIONS: frozenset[str] = frozenset(
+    {
+        "ABOUT",
+        "LOCATED_IN",
+        "OCCURRED_IN",
+        "OCCURRED_AT",
+        "HAPPENED_AT",
+    }
+)
+
+#: Relations whose edge points **from a participant to the event**:
+#:
+#: ``agent -PARTICIPATED_IN-> event``
+#:
+#: These are also traversed backwards so that a path anchored at an *event*
+#: can reach its participants ("Sự kiện X diễn ra ở đâu, ai tham gia?").
+PARTICIPANT_TO_EVENT_RELATIONS: frozenset[str] = frozenset(
+    {
+        "PARTICIPATED_IN",
+        "AGENT_OF",
+        "INVOLVES",
+    }
+)
+
+#: The relations that are traversed in both directions.
+BIDIRECTIONAL_RELATIONS: frozenset[str] = (
+    EVENT_TO_ARGUMENT_RELATIONS | PARTICIPANT_TO_EVENT_RELATIONS
+)
+
 _CAUSAL_CUE_RE = re.compile(
     r"(vì sao|tại sao|nguyên nhân|lý do|do đâu|vì|làm sao|cause)", re.IGNORECASE
 )
@@ -228,6 +272,7 @@ class GraphSearcher:
         self.default_max_paths = int(cfg.get("graph_max_paths", 20))
         self.max_paths_per_hop = int(cfg.get("graph_max_paths_per_hop", 30))
         self._neighbor_cache: dict[str, list[dict[str, Any]]] = {}
+        self._hub_cache: dict[str, list[dict[str, Any]]] = {}
         self._degree_cache: dict[str, int] = {}
 
     # ------------------------------------------------------------------
@@ -291,7 +336,6 @@ class GraphSearcher:
     # ------------------------------------------------------------------
     def _neighbors(self, uid: str) -> list[dict[str, Any]]:
         """The *outgoing* neighbours of ``uid`` (directed edges only).
-
         :meth:`GraphStore.neighbors` is undirected, which loses the true
         direction of a relation and produces bogus paths such as
         ``A -CAUSE_OF-> B`` where the edge really is ``B -CAUSE_OF-> A``.
@@ -309,6 +353,81 @@ class GraphSearcher:
             return cached
         rows = self._directed_rows(uid)
         self._neighbor_cache[uid] = rows
+        return rows
+
+    def _event_hub_rows(self, uid: str) -> list[dict[str, Any]]:
+        """The *incoming* edges of the event hub, reversed.
+
+        The knowledge graph models an event as a node of its own:
+
+        ``agent -PARTICIPATED_IN-> event -ABOUT-> theme``
+
+        A question about the *theme* ("Ai là người thành lập Văn Lang?")
+        links the theme, while the answer is the **agent** of the event.  The
+        two are only connected through the event hub, and the ``ABOUT`` edge
+        points the other way -- so a traversal that only follows the forward
+        direction of the edges can never leave the theme (this is why 60+ of
+        the VHE questions had *zero* graph paths).
+
+        This helper therefore returns the incoming edges of the hub
+        relations *reversed* (theme -> event, event -> agent), so that the
+        traversal can continue with the usual forward edges.  The reversed
+        edge keeps the relation properties of the original edge -- in
+        particular its ``source_chunk_ids``, which point at the sentence the
+        event was extracted from.
+
+        Only the *hub* relations are reversed; the ``SUPPORTED_BY`` edges
+        stay excluded (they are provenance, not reasoning).
+        """
+        cached = self._hub_cache.get(uid)
+        if cached is not None:
+            return cached
+        runner = getattr(self.store, "_run", None)
+        rows: list[dict[str, Any]] = []
+        if callable(runner):
+            try:
+                records = runner(
+                    """
+                    MATCH (a:Entity {uid: $uid})<-[r]-(b:Entity)
+                    WHERE type(r) IN $rels
+                    RETURN b{.*} AS src, type(r) AS rel, properties(r) AS rprops, a{.*} AS dst
+                    LIMIT 200
+                    """,
+                    uid=uid,
+                    rels=sorted(BIDIRECTIONAL_RELATIONS),
+                )
+                rows = [
+                    {
+                        "src": dict(r["src"]),
+                        "rel": r["rel"],
+                        "rel_props": dict(r["rprops"]),
+                        "dst": dict(r["dst"]),
+                    }
+                    for r in records
+                ]
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("event hub rows(%r) failed: %s", uid, exc)
+        if not rows:
+            try:
+                for row in self.store.neighbors(uid) or []:
+                    src = row.get("src") or {}
+                    dst = row.get("dst") or {}
+                    if str(dst.get("uid") or "") != uid:
+                        continue
+                    rel = str(row.get("rel") or "")
+                    if rel not in BIDIRECTIONAL_RELATIONS:
+                        continue
+                    rows.append(
+                        {
+                            "src": dict(src),
+                            "rel": rel,
+                            "rel_props": dict(row.get("rel_props") or {}),
+                            "dst": dict(dst),
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("event hub rows(%r) failed: %s", uid, exc)
+        self._hub_cache[uid] = rows
         return rows
 
     def _directed_rows(self, uid: str) -> list[dict[str, Any]]:
@@ -339,24 +458,15 @@ class GraphSearcher:
         except Exception as exc:  # noqa: BLE001
             logger.debug("neighbors(%r) failed: %s", uid, exc)
             raw_rows = []
+        # ``neighbors()`` returns the edges *incident* to ``uid`` with their
+        # true orientation; keep only the outgoing ones.
         out: list[dict[str, Any]] = []
         for row in raw_rows:
             src = row.get("src") or {}
             dst = row.get("dst") or {}
-            src_uid = str(src.get("uid") or "")
-            dst_uid = str(dst.get("uid") or "")
-            if src_uid == uid:
-                out.append(row)
-            elif dst_uid == uid:
-                # orient the edge away from the expanded node
-                out.append(
-                    {
-                        "src": dst,
-                        "rel": row.get("rel"),
-                        "rel_props": row.get("rel_props") or {},
-                        "dst": src,
-                    }
-                )
+            if str(src.get("uid") or "") != uid:
+                continue
+            out.append(row)
         return out
 
     def _traverse(self, anchors: list[str], max_hops: int) -> list[GraphPath]:
@@ -400,7 +510,7 @@ class GraphSearcher:
         current_uid = str(nodes[-1].get("uid") or "")
         if depth >= max_hops or len(out) >= budget:
             return
-        for row in self._neighbors(current_uid):
+        for row in self._outgoing_rows(current_uid):
             src = row.get("src") or {}
             dst = row.get("dst") or {}
             src_uid = str(src.get("uid") or "")
@@ -447,6 +557,40 @@ class GraphSearcher:
                 seen_signatures=seen_signatures,
                 budget=budget,
             )
+
+    def _outgoing_rows(self, uid: str) -> list[dict[str, Any]]:
+        """The edges that may be followed **out of** ``uid``.
+
+        Two kinds of edges are returned:
+
+        1. the *forward* edges of ``uid`` (the usual directed traversal);
+        2. the *reversed* incoming edges of the event hub (see
+           :meth:`_event_hub_rows`).
+
+        The second kind is what makes the VHE template questions work: the
+        anchor of "Ai là người thành lập Văn Lang?" is the *theme*, and the
+        answer is the *agent* of the event that is ``ABOUT`` the theme.  The
+        forward edges of the theme are empty, so without the hub the
+        traversal stops immediately with zero paths.
+
+        The reversed edge is marked with ``"reversed": True`` so that the
+        scoring can tell it apart from a genuine forward edge.
+        """
+        rows = list(self._neighbors(uid))
+        for row in self._event_hub_rows(uid):
+            src = row.get("src") or {}
+            dst = row.get("dst") or {}
+            if str(dst.get("uid") or "") != uid:
+                continue
+            reversed_row = {
+                "src": dict(dst),
+                "rel": row.get("rel"),
+                "rel_props": dict(row.get("rel_props") or {}),
+                "dst": dict(src),
+                "reversed": True,
+            }
+            rows.append(reversed_row)
+        return rows
 
     @staticmethod
     def _signature(

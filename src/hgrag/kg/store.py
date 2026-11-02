@@ -227,6 +227,14 @@ class Neo4jGraphStore:
         return [_restore_extra(dict(r["props"])) for r in records]
 
     def neighbors(self, uid: str, rel_types: list[str] | None = None) -> list[dict[str, Any]]:
+        """The edges *incident* to ``uid`` (both directions).
+
+        ``src``/``dst`` always describe the **true** orientation of the edge
+        (they are *not* swapped so that ``uid`` is the source), so that the
+        consumer can tell an incoming edge from an outgoing one.  The
+        in-memory store used to swap them, which made the two backends
+        disagree and broke the event-hub traversal.
+        """
         rel_filter = ""
         if rel_types:
             safe = [t for t in rel_types if t.replace("_", "").isalnum()]
@@ -235,7 +243,8 @@ class Neo4jGraphStore:
         records = self._run(
             f"""
             MATCH (a:Entity {{uid: $uid}})-[r{rel_filter}]-(b:Entity)
-            RETURN a{{.*}} AS src, type(r) AS rel, properties(r) AS rprops, b{{.*}} AS dst
+            WITH startNode(r) AS s, endNode(r) AS e, type(r) AS t, properties(r) AS p
+            RETURN s{{.*}} AS src, t AS rel, p AS rprops, e{{.*}} AS dst
             LIMIT 500
             """,
             uid=uid,
@@ -328,18 +337,25 @@ class InMemoryGraphStore:
         return [dict(r) for r in rows]
 
     def neighbors(self, uid: str, rel_types: list[str] | None = None) -> list[dict[str, Any]]:
+        """The edges *incident* to ``uid`` (both directions).
+
+        ``src``/``dst`` always describe the **true** orientation of the edge
+        (they are *not* swapped so that ``uid`` is the source), so that the
+        consumer can tell an incoming edge from an outgoing one.  The
+        in-memory store used to swap them, which made the two backends
+        disagree and broke the event-hub traversal.
+        """
         out = []
         for rel in self.relations.values():
             if rel_types and rel["rel_type"] not in rel_types:
                 continue
             if uid in (rel["src"], rel["dst"]):
-                other = rel["dst"] if rel["src"] == uid else rel["src"]
                 out.append(
                     {
                         "src": self.entities.get(rel["src"], {}),
                         "rel": rel["rel_type"],
                         "rel_props": {k: v for k, v in rel.items() if k not in ("src", "dst")},
-                        "dst": self.entities.get(other, {}),
+                        "dst": self.entities.get(rel["dst"], {}),
                     }
                 )
         return out

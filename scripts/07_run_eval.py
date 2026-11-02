@@ -50,8 +50,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--systems",
         type=str,
         nargs="+",
-        default=list(SYSTEMS),
-        help="các hệ thống cần chạy (B0 B1 B2 ours)",
+        default=None,
+        help=(
+            "các hệ thống cần chạy (B0 B1 B2 ours A1_no_entity_linking ...). "
+            "Khi không chỉ định, chạy 4 hệ thống chính + 7 ablation"
+        ),
+    )
+    p.add_argument(
+        "--with-ablations",
+        action="store_true",
+        help=(
+            "chạy thêm cả 7 hệ thống ablation (mặc định: chỉ khi --systems "
+            "không được chỉ định)"
+        ),
     )
     p.add_argument("--no-ablations", action="store_true", help="bỏ 7 ablation")
     p.add_argument("--mock", action="store_true", help="chạy offline (mock LLM + embedder)")
@@ -121,11 +132,20 @@ def main(argv: list[str] | None = None) -> int:
     checkpoint = args.checkpoint
     if checkpoint and not Path(checkpoint).is_absolute():
         checkpoint = str(REPO_ROOT / checkpoint)
+    # Khi ``--systems`` được chỉ định rõ, mặc định KHÔNG tự thêm 7 hệ thống
+    # ablation -- nếu không thì mỗi worker của ``launch_eval.sh`` sẽ chạy lại
+    # toàn bộ ablation (tức là 4 lần số câu hỏi bị đốt quota vô ích).
+    if args.systems is None:
+        systems = list(SYSTEMS)
+        run_ablations = not args.no_ablations
+    else:
+        systems = list(args.systems)
+        run_ablations = args.with_ablations and not args.no_ablations
     run = run_evaluation(
         pipeline,
         dataset,
-        systems=list(args.systems),
-        ablations=not args.no_ablations,
+        systems=systems,
+        ablations=run_ablations,
         judge=judge,
         limit=args.limit,
         skip_existing=not args.no_resume,
@@ -146,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
         )
         for baseline in ("B0", "B1", "B2")
-        if baseline in args.systems
+        if baseline in systems
     ]
 
     reports_dir = Path(args.reports)

@@ -518,8 +518,11 @@ class _StubPipeline:
     def __init__(self, answer: str = "Đáp án [E1]") -> None:
         self.answer = answer
         self.llm_client = None
+        #: The ablation flags that were passed to the last ``ask()`` call.
+        self.ablations: list[dict] = []
 
     def ask(self, question, ablation=None, system="ours", **kwargs):  # noqa: D102
+        self.ablations.append(dict(ablation or {}))
         return _StubResult(self.answer)
 
     def answer_llm_only(self, question, system="B0"):  # noqa: D102
@@ -595,6 +598,40 @@ def test_run_evaluation_includes_ablation_rows() -> None:
     )
     assert len(ABLATIONS) == 7
     assert {r.system for r in run.rows} == {"ours", *ABLATIONS.keys()}
+
+
+def test_named_ablation_system_actually_disables_its_component() -> None:
+    """A system named after an ablation must disable that component.
+
+    Nếu không, ``A4_no_graph`` chỉ là một bản sao của ``ours`` và bảng
+    ablation trong báo cáo vô nghĩa.
+    """
+    pipeline = _StubPipeline()
+    run = run_evaluation(
+        pipeline,
+        _dataset(),
+        systems=("ours", "A4_no_graph"),
+        ablations=False,
+        judge=HeuristicJudge(),
+    )
+    assert {r.system for r in run.rows} == {"ours", "A4_no_graph"}
+    # `ours` chạy pipeline đầy đủ, còn `A4_no_graph` phải tắt thành phần đồ thị.
+    assert pipeline.ablations[-1] == {"no_graph": True}
+
+
+def test_explicit_ablation_systems_are_not_duplicated() -> None:
+    """Chỉ định sẵn hệ thống ablation thì không được chạy lại nó."""
+    run = run_evaluation(
+        _StubPipeline(),
+        _dataset(),
+        systems=("ours", "A4_no_graph"),
+        ablations=True,
+        judge=HeuristicJudge(),
+    )
+    keys = [(r.system, r.qid) for r in run.rows]
+    assert len(keys) == len(set(keys)), "một cặp (hệ thống, câu hỏi) bị chạy trùng"
+    # `A4_no_graph` đã có trong --systems nên không được thêm lần nữa.
+    assert len({r.system for r in run.rows}) == 2 + len(ABLATIONS) - 1
 
 
 def test_run_evaluation_scores_retrieval_metrics() -> None:

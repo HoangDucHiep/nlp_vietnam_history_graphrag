@@ -7,6 +7,7 @@ vector store is a numpy fake.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -16,6 +17,7 @@ from hgrag.kg.alias import AliasResolver
 from hgrag.llm.client import MockLLMClient
 from hgrag.qa.answer import (
     AnswerGenerator,
+    is_degenerate,
     is_refusal,
     parse_reasoning_chain,
     validate_citations,
@@ -172,6 +174,103 @@ def test_answer_generator_strips_reasoning_from_answer_body(mock_llm, settings) 
         evidence=[Evidence(evidence_id="E1", kind="chunk", text="x")],
     )
     assert "## Suy luận" not in result.answer
+
+
+# --------------------------------------------------------------------------
+# baseline B0 (closed-book) -- JSON mode + bộ phát hiện lặp
+# --------------------------------------------------------------------------
+
+
+class _ScriptedLLM:
+    """A fake client that returns a canned payload per ``task``."""
+
+    name = "scripted"
+
+    def __init__(self, payloads: dict[str, str]) -> None:
+        self.payloads = payloads
+        self.calls: list[Any] = []
+
+    def generate(self, request: Any) -> Any:
+        self.calls.append(request)
+        from hgrag.llm.schemas import LLMResponse
+
+        return LLMResponse(text=self.payloads.get(request.task, ""), model="scripted")
+
+
+def test_closed_book_uses_json_schema() -> None:
+    """B0 phải dùng JSON mode: có schema thì API tắt kênh suy luận."""
+    llm = _ScriptedLLM({"answer_closed_book": '{"answer": "Hùng Vương."}'})
+    generator = AnswerGenerator(llm, None)
+    result = generator.generate_closed_book("Ai là người thành lập Văn Lang?")
+    assert result.answer == "Hùng Vương."
+    assert llm.calls[0].response_schema is not None
+    assert llm.calls[0].response_schema["properties"]["answer"]["type"] == "string"
+
+
+def test_closed_book_parses_reasoning_steps() -> None:
+    llm = _ScriptedLLM(
+        {
+            "answer_closed_book": json.dumps(
+                {
+                    "answer": "Hùng Vương.",
+                    "reasoning_steps": ["Bước một", "Bước hai"],
+                },
+                ensure_ascii=False,
+            )
+        }
+    )
+    generator = AnswerGenerator(llm, None)
+    result = generator.generate_closed_book("Ai là người thành lập Văn Lang?")
+    assert result.reasoning_chain == ["Bước một", "Bước hai"]
+    assert "Hùng Vương." in result.answer
+
+
+def test_closed_book_rejects_degenerate_answer() -> None:
+    """Câu trả lời lặp (Gemma rơi vào vòng lặp) không được dùng làm đáp án."""
+    llm = _ScriptedLLM(
+        {
+            "answer_closed_book": json.dumps(
+                {"answer": "phất phất phất phất phất phất phất phất"}, ensure_ascii=False
+            ),
+            "answer_closed_book_text": "phất phất phất phất phất phất phất phất",
+        }
+    )
+    generator = AnswerGenerator(llm, None)
+    result = generator.generate_closed_book("Ai là người sinh ra Đế Nghi?")
+    assert result.refused
+    assert result.answer == REFUSAL_ANSWER
+
+
+def test_closed_book_falls_back_to_plain_text() -> None:
+    """Khi JSON hỏng thì thử lại bằng prompt văn bản thuần."""
+    llm = _ScriptedLLM(
+        {
+            "answer_closed_book": "không phải JSON",
+            "answer_closed_book_text": "Đế Minh là người sinh ra Đế Nghi.",
+        }
+    )
+    generator = AnswerGenerator(llm, None)
+    result = generator.generate_closed_book("Ai là người sinh ra Đế Nghi?")
+    assert "Đế Minh" in result.answer
+    assert not result.refused
+
+
+@pytest.mark.parametrize(
+    ("text", "degenerate"),
+    [
+        ("phất phất phất phất phất phất", True),
+        (
+            "theo truyền thuyết, theo truyền thuyết, theo truyền thuyết, "
+            "theo truyền thuyết, theo truyền thuyết, x",
+            True,
+        ),
+        ("Trần Hưng Đạo chỉ huy quân tại trận Bạch Đằng năm 1285.", False),
+        ("Hùng Vương là người thành lập Văn Lang.", False),
+        ("Đế Minh sinh ra Đế Nghi. Đế Minh sinh ra Kinh Dương Vương.", False),
+    ],
+)
+def test_is_degenerate(text: str, degenerate: bool) -> None:
+    assert is_degenerate(text) is degenerate
 
 
 # --------------------------------------------------------------------------

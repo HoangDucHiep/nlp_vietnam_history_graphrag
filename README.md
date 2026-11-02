@@ -163,25 +163,58 @@ Test tự động chặn network (fixture `block_network`); test cần mạng ph
 
 ## 8. Ghi chú về quota Gemini (free tier)
 
-* Mỗi model Flash có quota ~20 request/ngày → client **xoay model** khi gặp HTTP 429,
-  và **ghi nhớ** model đã cạn (`_exhausted_models`) để không phải trả giá một lần gọi
-  thất bại cho mỗi request.
-* **Quota embedding là độc lập** với quota chat. Khi model embedding chính hết quota,
-  client **fail fast** (không ngủ tới lúc reset ~20 giờ) rồi **chuyển sang model
-  embedding dự phòng**; nếu mọi model embedding đều cạn thì dùng model **cục bộ**
-  `paraphrase-multilingual-MiniLM-L12-v2` (384 chiều) và corpus được embed lại
-  bằng đúng model mới để không gian vector nhất quán.
+Quota free tier của Google AI Studio **không chỉ giới hạn số request**. Bảng
+đo thực nghiệm (xem [`docs/10_quota_gemini_free_tier.md`](docs/10_quota_gemini_free_tier.md)):
+
+| Họ model | Quota thật | Hệ quả |
+|---|---|---|
+| `gemini-3.x-flash` | 20 request / **ngày** | nhanh chóng cạn khi chạy song song |
+| `gemini-3.x-flash-lite` | 500 request / **ngày** | cạn sau vài phút |
+| `gemma-4-26b-a4b-it` | **16 000 input token / phút** | bền vững, dùng làm model chính |
+| `gemma-4-31b-it` | — | phần lớn lời gọi trả `500 INTERNAL`, latency 37–63 s |
+
+* **Giãn nhịp theo token, không theo request.** Một limiter đếm *request/phút*
+  không diễn tả được hạn mức token: 26 request × ~800 token = 20 800 token/phút
+  > 16 000. `SharedTokenLimiter` (`src/hgrag/llm/rate_limit.py`) giới hạn
+  **token/phút** và chia sẻ hạn mức giữa các tiến trình qua `fcntl.flock` trên
+  `artifacts/rate_limits/<model>.tokens.json`.
+* **Đếm token trước khi gọi.** `models.count_tokens` **không** tiêu tốn quota
+  sinh nội dung (đã kiểm chứng) và trả về đúng số token mà API ghi nhận, nên
+  client đặt trước lượng token của request vào hạn mức dùng chung. System prompt
+  được đếm riêng vì Developer API không nhận `system_instruction` trong
+  `count_tokens`.
+* **429 theo phút ≠ 429 theo ngày.** Khi API trả 429 kèm `RetryInfo` ngắn, client
+  **chờ rồi thử lại đúng model đó**. Xoay sang model dự phòng sẽ đốt quota
+  *ngày* của Gemini — không thể hoàn lại trong một lượt chạy.
+* **Quota embedding độc lập** với quota chat. Khi model embedding chính hết
+  quota, client **fail fast** (không ngủ tới lúc reset ~20 giờ) rồi **chuyển sang
+  model embedding dự phòng**; nếu mọi model embedding đều cạn thì dùng model
+  **cục bộ** `paraphrase-multilingual-MiniLM-L12-v2` (384 chiều) và corpus được
+  embed lại bằng đúng model mới để không gian vector nhất quán.
 * **Reranker**: `bge-reranker-v2-m3` mất ~35 s/lần gọi trên CPU. `rerank_backend: auto`
   tự phát hiện CUDA → có GPU dùng cross-encoder, không có GPU dùng heuristic reranker.
+* **JSON của judge được sửa, không bị bỏ.** Gemma đôi khi rơi vào vòng lặp lặp
+  và bị cắt ngang giữa chừng; `LLMClient._extract_json` khôi phục lại các
+  trường rubric đã viết trọn vẹn. Nếu vẫn không được, dòng đó được đánh dấu
+  `judge_degraded` và **báo cáo cảnh báo rõ ràng** thay vì trộn điểm heuristic
+  với điểm LLM.
 * Mọi lời gọi LLM **và embedding** được cache đĩa tại `artifacts/llm_cache/`
-  (khoá theo nội dung + model) → chạy lại **không tốn quota**.
+  (khoá theo nội dung **+ model**, nên đổi model không dùng lại kết quả của
+  model cũ) → chạy lại **không tốn quota**.
 * Run đánh giá dài hỗ trợ **checkpoint + resume**:
   ```bash
   python scripts/07_run_eval.py --checkpoint artifacts/eval_checkpoint.json
   ```
-  Khi bị 429 giữa chừng, chạy lại lệnh trên sẽ bỏ qua các cặp `(system, qid)`
+  Khi bị gián đoạn, chạy lại lệnh trên sẽ bỏ qua các cặp `(system, qid)`
   đã chấm xong.
 * Nếu hết quota toàn bộ: hệ thống tự chuyển sang chế độ **mock** (offline) để vẫn demo được.
+
+Kiểm tra lại hạn mức và đường giãn nhịp:
+
+```bash
+python scripts/validate_pacing.py pacing 24 6   # không được có 429
+python scripts/validate_pacing.py judge         # verdict phải từ LLM, không heuristic
+```
 
 ## 9. Giấy phép / ghi nhận
 
