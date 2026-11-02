@@ -41,6 +41,16 @@ from typing import Any
 from ..config import Settings
 from ..data.normalize import name_key
 from ..data.records import Chunk, Entity
+from ..kg.labels import (
+    EVENT_TYPE_VN,
+    ROLE_VN,
+    clean_mention,
+    event_label,
+    event_verb,
+    is_proper_mention,
+    is_usable_entity,
+    pick_mention,
+)
 from ..llm.schemas import LLMMessage, LLMRequest
 from .dataset import EvalDataset, EvalQuestion
 
@@ -94,58 +104,10 @@ OUT_OF_KB_QUESTIONS: tuple[str, ...] = (
 )
 
 #: Vietnamese label of every VHE event type (used to build natural questions).
-EVENT_TYPE_VN: dict[str, str] = {
-    "be-born": "sinh ra",
-    "marry": "cưới",
-    "divorce": "ly hôn",
-    "injure": "làm bị thương",
-    "die": "qua đời",
-    "transport": "di chuyển",
-    "start-position": "đảm nhiệm chức vụ",
-    "end-position": "thôi giữ chức vụ",
-    "elect": "được bầu",
-    "nominate": "được tiến cử",
-    "arrest-jail": "bị bắt giam",
-    "release-parole": "được thả tự do",
-    "trial-hearing": "ra tòa xét xử",
-    "charge-indict": "bị khởi tứ",
-    "sue": "kiện tụng",
-    "convict": "bị kết án",
-    "sentence": "bị tuyên án",
-    "fine": "bị phạt tiền",
-    "execute": "bị thi hành án",
-    "extradite": "bị dẫn đội",
-    "acquit": "được tuyên vô tội",
-    "appeal": "kêu án",
-    "pardon": "được tha tội",
-    "transfer-ownership": "chuyển nhượng",
-    "transfer-money": "chuyển tiền",
-    "start-org": "thành lập",
-    "end-org": "giải thể",
-    "merge-org": "sáp nhập",
-    "declare-bankruptcy": "phá sản",
-    "attack": "tấn công",
-    "demonstrate": "biểu tình",
-    "meet": "gặp gỡ",
-    "phone-write": "gửi thư",
-    "natural-disaster": "thiên tai",
-    "natural-phenomenon": "hiện tượng tự nhiên",
-}
-
-#: Vietnamese label of every VHE argument role.
-ROLE_VN: dict[str, str] = {
-    "agent": "chủ thể",
-    "theme": "đối tượng",
-    "beneficiary": "người thụ hưởng",
-    "experiencer": "người trải nghiệm",
-    "instrument": "phương tiện",
-    "content": "nội dung",
-    "goal": "mục đích",
-    "force": "lực lượng",
-    "location": "địa điểm",
-    "temporal": "thời gian",
-    "source": "nguồn",
-}
+#: The mapping lives in :mod:`hgrag.kg.labels` so that the knowledge graph
+#: and the evaluation set name the very same event the very same way.
+EVENT_TYPE_VN = EVENT_TYPE_VN
+ROLE_VN = ROLE_VN
 
 _YEAR_RE = re.compile(r"(?<!\d)(9[0-9]{2}|1[0-9]{3})(?!\d)")
 _CAP_RE = re.compile(
@@ -338,27 +300,20 @@ _MIN_CHAT_QUESTION_CHARS = 15
 
 
 def _clean_mention(mention: str) -> str:
-    """Strip the ``vua [Kinh Dương Vương]`` bracket notation of VHE."""
-    text = (mention or "").strip()
-    match = re.match(r"^\w+\s*\[([^\]]+)\]$", text)
-    if match:
-        text = match.group(1).strip()
-    return text
+    """Strip the ``vua [Kinh Dương Vương]`` bracket notation of VHE.
+
+    Thin wrapper around :func:`hgrag.kg.labels.clean_mention` so that the
+    rest of the module keeps its local (private) name.
+    """
+    return clean_mention(mention)
 
 
 def _is_proper(mention: str) -> bool:
-    """Whether a mention looks like a named entity (not a generic noun)."""
-    text = _clean_mention(mention)
-    if not text or len(text) < 2:
-        return False
-    if not text[0].isupper():
-        return False
-    if name_key(text) in {name_key(g) for g in _GENERIC_MENTIONS}:
-        return False
-    tokens = text.split()
-    if len(tokens) == 1 and len(tokens[0]) < 4:
-        return False
-    return True
+    """Whether a mention looks like a named entity (not a generic noun).
+
+    Thin wrapper around :func:`hgrag.kg.labels.is_proper_mention`.
+    """
+    return is_proper_mention(mention)
 
 
 def _is_usable_entity(mention: str) -> bool:
@@ -367,13 +322,10 @@ def _is_usable_entity(mention: str) -> bool:
     A single generic-looking capitalised word (``"Giáp"``, ``"Các"``) is a
     poor gold entity: it cannot be matched reliably by the entity linker.
     Multi-word names and long single words are accepted.
+
+    Thin wrapper around :func:`hgrag.kg.labels.is_usable_entity`.
     """
-    if not _is_proper(mention):
-        return False
-    tokens = _clean_mention(mention).split()
-    if len(tokens) >= 2:
-        return True
-    return len(tokens[0]) >= 5
+    return is_usable_entity(mention)
 
 
 def _extract_years(text: str, lo: int = 905, hi: int = 1975) -> list[int]:
@@ -525,11 +477,14 @@ class EvalDatasetBuilder:
         self._max_chunks = max(0, int(max_llm_chunks))
         self._llm_broken = False
         self._entity_index: dict[str, Entity] = {}
+        self._kg_names: set[str] = set()
         for entity in self.kg_entities:
             for name in [entity.name, *entity.aliases]:
                 key = name_key(name)
                 if key and key not in self._entity_index:
                     self._entity_index[key] = entity
+            if entity.name:
+                self._kg_names.add(name_key(entity.name))
         self._seen: set[str] = set()
         self._corpus_loaded = bool(self.corpus_chunks)
         self._chunk_keys: dict[str, str] = {}
@@ -927,12 +882,7 @@ class EvalDatasetBuilder:
             by_role.setdefault(role, []).append(mention)
 
         def pick(role: str, proper_only: bool = True) -> str:
-            for value in by_role.get(role, []):
-                if not proper_only:
-                    return value
-                if _is_usable_entity(value):
-                    return value
-            return ""
+            return pick_mention(by_role.get(role, []), proper_only=proper_only)
 
         agent = pick("agent")
         theme = pick("theme")
@@ -940,7 +890,7 @@ class EvalDatasetBuilder:
         temporal = pick("temporal", proper_only=False)
         goal = pick("goal", proper_only=False)
         trigger = str(event.get("trigger_word") or "").strip()
-        verb = EVENT_TYPE_VN.get(etype, trigger or etype)
+        verb = event_verb(etype, trigger)
         return {
             "type": etype,
             "agent": agent,
@@ -961,14 +911,12 @@ class EvalDatasetBuilder:
         add that prefix themselves, so the label can be embedded directly.
         A label without a named entity (``"nhật thực"``) is unusable as a
         question subject, so it falls back to the trigger word.
+
+        The very same helper builds the names of the event nodes of the
+        knowledge graph (:mod:`hgrag.kg.vhe_gold`), so a gold path and the
+        retrieved graph path are spelled identically.
         """
-        if agent and theme:
-            return f"{agent} {verb} {theme}"
-        if agent:
-            return f"{agent} {verb}"
-        if theme:
-            return f"{verb} {theme}"
-        return trigger or verb
+        return event_label(agent, verb, theme, trigger)
 
     def _label(self, event: dict[str, Any], exclude: str = "") -> str:
         """Event label that never mentions ``exclude`` (no answer leakage)."""
@@ -1014,7 +962,7 @@ class EvalDatasetBuilder:
             question_type=qtype,
             gold_entities=entities,
             gold_qids=qids,
-            gold_paths=[path] if path else [],
+            gold_paths=[self._kg_path("", path)] if path else [],
             gold_chunk_ids=[],
             gold_relations=relations,
             year_refs=years,
@@ -1336,9 +1284,12 @@ class EvalDatasetBuilder:
             if matched is not None and matched.wikidata_id:
                 qids.append(matched.wikidata_id)
         years = [int(y) for y in payload.get("years") or []] or _extract_years(payload["question"])
-        path = list(entities)
-        if len(path) < 2:
-            path = [title] + path
+        # The gold path must be a *real* path of the knowledge graph, not
+        # just the list of entities the LLM mentioned: the metric
+        # ``path_hit_rate`` compares it with the paths the retriever walks.
+        # The anchor is the document title (it is the node the chunk is
+        # attached to via ``SUPPORTED_BY``), followed by the entities.
+        path = self._kg_path(title, entities)
         difficulty = {"single_hop": "easy", "multi_hop": "medium", "temporal": "medium"}.get(
             qtype, "medium"
         )
@@ -1366,6 +1317,52 @@ class EvalDatasetBuilder:
             },
         )
         return _Candidate(question=question, priority=1)
+
+    def _kg_path(self, anchor: str, entities: Sequence[str]) -> list[str]:
+        """Build a gold path that only contains nodes the KG actually has.
+
+        The path starts at the document title (the node the chunk is
+        attached to) and continues with the mentioned entities.  Every name
+        is resolved against the entity index of the knowledge graph, so the
+        gold path uses the *exact* spelling of the node ("vua Hán" becomes
+        "vua Hán", not "Vua Hán").
+
+        A name that the KG does not know cannot be hit by the retriever, so
+        keeping it in the gold path would only deflate ``path_hit_rate``.
+        Such names are therefore **dropped** -- unless dropping them would
+        leave the path with less than two nodes (a path needs at least one
+        edge to be meaningful).
+        """
+        path: list[str] = []
+        unresolved: list[str] = []
+        for name in [anchor, *entities]:
+            clean = str(name or "").strip()
+            if not clean:
+                continue
+            matched = self._entity_index.get(name_key(clean))
+            if matched is not None:
+                node_name = matched.name
+            elif self._kg_has_node(clean):
+                node_name = clean
+            else:
+                unresolved.append(clean)
+                continue
+            if node_name not in path:
+                path.append(node_name)
+        if len(path) < 2:
+            # Keep the original path: a one-node path carries no edge and
+            # would be trivially "hit" by any retrieved path.
+            return [str(n).strip() for n in [anchor, *entities] if str(n).strip()]
+        return path
+
+    def _kg_has_node(self, name: str) -> bool:
+        """Whether the KG has a node whose name *contains* ``name``."""
+        if not self._kg_names:
+            return False
+        key = name_key(name)
+        if not key:
+            return False
+        return any(key in candidate for candidate in self._kg_names)
 
     @staticmethod
     def _classify(question: str) -> str:
@@ -1412,6 +1409,9 @@ class EvalDatasetBuilder:
                 # it is really a single-hop question.
                 qtype = "single_hop"
             difficulty = "hard" if qtype == "multi_hop" else "medium"
+            # Only keep a gold path when every node of it exists in the KG
+            # (see :meth:`_kg_path`).
+            path = self._kg_path("", entities)
             candidates.append(
                 _Candidate(
                     question=EvalQuestion(
@@ -1421,7 +1421,7 @@ class EvalDatasetBuilder:
                         question_type=qtype,
                         gold_entities=entities,
                         gold_qids=[],
-                        gold_paths=[entities] if len(entities) >= 2 else [],
+                        gold_paths=[path] if len(path) >= 2 else [],
                         gold_chunk_ids=chunks,
                         gold_relations=[],
                         year_refs=years,

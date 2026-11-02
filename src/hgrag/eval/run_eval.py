@@ -20,7 +20,7 @@ from typing import Any
 
 from . import metrics as M
 from .dataset import EvalDataset, EvalQuestion
-from .judge import JudgeResult, build_judge
+from .judge import JudgeResult, build_judge, is_out_of_kb
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,12 @@ class EvalRow:
     gold_fact_accuracy: float = 0.0
     n_evidence: int = 0
     n_citations: int = 0
+    #: Whether the retrieval metrics of this row are *applicable*: a question
+    #: without a gold path cannot be hit, and a question without a gold chunk
+    #: cannot be recalled.  Such rows are excluded from the average of the
+    #: corresponding metric instead of being counted as a miss.
+    path_applicable: bool = False
+    chunk_applicable: bool = False
     linked_entities: list[str] = field(default_factory=list)
     retrieved_paths: list[list[str]] = field(default_factory=list)
     retrieved_chunks: list[str] = field(default_factory=list)
@@ -110,6 +116,8 @@ class EvalRow:
             "gold_fact_accuracy": round(self.gold_fact_accuracy, 6),
             "n_evidence": self.n_evidence,
             "n_citations": self.n_citations,
+            "path_applicable": self.path_applicable,
+            "chunk_applicable": self.chunk_applicable,
             "linked_entities": list(self.linked_entities),
             "retrieved_paths": list(self.retrieved_paths),
             "retrieved_chunks": list(self.retrieved_chunks),
@@ -192,6 +200,7 @@ def _score_row(
         reference=question.answer,
         gold_facts=list(question.gold_relations),
         evidence=evidence,
+        out_of_kb=is_out_of_kb(question),
     )
 
     markers = M.extract_citation_markers(answer)
@@ -229,6 +238,8 @@ def _score_row(
         gold_fact_accuracy=M.gold_fact_accuracy(question.gold_relations, answer),
         n_evidence=len(evidence),
         n_citations=len(markers),
+        path_applicable=bool(question.gold_paths),
+        chunk_applicable=bool(question.gold_chunk_ids),
         linked_entities=linked_entities,
         retrieved_paths=retrieved_paths,
         retrieved_chunks=retrieved_chunks,
@@ -428,6 +439,16 @@ def summarize_system(run: EvalRun, system: str) -> dict[str, Any]:
         "avg_n_evidence": sum(r.n_evidence for r in rows) / len(rows),
     }
     payload.update(M.aggregate([r.to_dict() for r in rows], metrics))
+    # The retrieval metrics only apply to the questions that *have* a gold
+    # path / a gold chunk.  Averaging them over all the rows would count
+    # every inapplicable question as a miss and deflate the metric.
+    payload["path_hit"] = _mean_applicable(rows, "path_hit", "path_applicable")
+    payload["chunk_recall_at_10"] = _mean_applicable(
+        rows, "chunk_recall_at_10", "chunk_applicable"
+    )
+    payload["ndcg_at_10"] = _mean_applicable(rows, "ndcg_at_10", "chunk_applicable")
+    payload["n_path_applicable"] = sum(1 for r in rows if r.path_applicable)
+    payload["n_chunk_applicable"] = sum(1 for r in rows if r.chunk_applicable)
 
     by_type: dict[str, Any] = {}
     for qtype in sorted({r.question_type for r in rows}):
@@ -437,10 +458,18 @@ def summarize_system(run: EvalRun, system: str) -> dict[str, Any]:
             "accuracy": sum(1.0 if r.judge_correct else 0.0 for r in subset) / len(subset),
             "groundedness": sum(1.0 if r.grounded else 0.0 for r in subset) / len(subset),
             "token_f1": sum(r.token_f1 for r in subset) / len(subset),
-            "path_hit": sum(r.path_hit for r in subset) / len(subset),
+            "path_hit": _mean_applicable(subset, "path_hit", "path_applicable"),
         }
     payload["by_type"] = by_type
     return payload
+
+
+def _mean_applicable(rows: Sequence[EvalRow], metric: str, flag: str) -> float:
+    """Mean of ``metric`` over the rows where ``flag`` is true."""
+    values = [float(getattr(r, metric)) for r in rows if getattr(r, flag, False)]
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
 
 
 def summarize_run(run: EvalRun) -> list[dict[str, Any]]:

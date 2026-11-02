@@ -26,7 +26,14 @@ from . import metrics as M
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["JudgeResult", "LLMJudge", "HeuristicJudge", "build_judge"]
+__all__ = [
+    "JudgeResult",
+    "LLMJudge",
+    "HeuristicJudge",
+    "build_judge",
+    "is_out_of_kb",
+    "looks_like_refusal",
+]
 
 JUDGE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -77,6 +84,62 @@ CONTEXT (evidence được trích dẫn):
 Hãy chấm điểm theo rubric trên.
 """
 
+#: Marker of a question that lies **outside** the knowledge base.  Such a
+#: question has no reference answer; it is graded by *behaviour* instead:
+#: the correct behaviour is to refuse, the wrong behaviour is to answer
+#: (i.e. to hallucinate).  See docs/04 §2.1 (nguồn D).
+OUT_OF_KB_MARKERS = ("out_of_kb", "out-of-kb", "ngoài phạm vi")
+
+#: Phrases that signal a refusal in a Vietnamese answer.  The list is kept
+#: deliberately **specific**: a generic phrase such as "không có thông tin"
+#: also occurs in legitimate answers ("chưa có thông tin nào về năm này") and
+#: would wrongly count them as a refusal.
+REFUSAL_PHRASES = (
+    "không tìm thấy đủ thông tin",
+    "không đủ thông tin trong kho kiến thức",
+    "không có trong kho kiến thức",
+    "ngoài phạm vi",
+    "không thuộc phạm vi",
+    "tài liệu hiện có không",
+    "không đủ căn cứ",
+    "không đủ dữ liệu để trả lời",
+)
+
+
+def is_out_of_kb(question: Any) -> bool:
+    """Whether ``question`` is an out-of-knowledge-base question.
+
+    The flag is read from ``question_type`` first and from the source
+    prefix second, so both the JSONL dataset and a bare string work.
+    """
+    if question is None:
+        return False
+    qtype = str(getattr(question, "question_type", "") or "").lower()
+    if any(marker in qtype for marker in OUT_OF_KB_MARKERS):
+        return True
+    source = str(getattr(question, "source", "") or "").lower()
+    if any(marker in source for marker in OUT_OF_KB_MARKERS):
+        return True
+    if isinstance(question, str):
+        return any(marker in question.lower() for marker in OUT_OF_KB_MARKERS)
+    return False
+
+
+def looks_like_refusal(answer: str) -> bool:
+    """Whether ``answer`` refuses to answer instead of inventing an answer.
+
+    The detection reuses :func:`hgrag.qa.answer.is_refusal` so that the
+    judge and the pipeline agree on what a refusal is.
+    """
+    from ..qa.answer import is_refusal
+
+    if is_refusal(answer):
+        return True
+    text = (answer or "").lower()
+    if not text.strip():
+        return True
+    return any(phrase in text for phrase in REFUSAL_PHRASES)
+
 
 @dataclass
 class JudgeResult:
@@ -120,8 +183,16 @@ class LLMJudge:
         reference: str = "",
         gold_facts: Sequence[str] | None = None,
         evidence: Sequence[Any] | None = None,
+        out_of_kb: bool = False,
     ) -> JudgeResult:
-        """Grade ``answer``."""
+        """Grade ``answer``.
+
+        ``out_of_kb`` switches to the *behaviour* rubric: the correct
+        answer is a refusal, and any attempt to answer the question is
+        scored as a hallucination (docs/04 §2.1, nguồn D).
+        """
+        if out_of_kb:
+            return _grade_out_of_kb(answer)
         context = _render_evidence(evidence)
         prompt = JUDGE_TEMPLATE.format(
             question=question,
@@ -138,6 +209,7 @@ class LLMJudge:
                 reference=reference,
                 gold_facts=gold_facts,
                 evidence=evidence,
+                out_of_kb=out_of_kb,
             )
         return _result_from_payload(payload)
 
@@ -175,7 +247,10 @@ class HeuristicJudge:
         reference: str = "",
         gold_facts: Sequence[str] | None = None,
         evidence: Sequence[Any] | None = None,
+        out_of_kb: bool = False,
     ) -> JudgeResult:
+        if out_of_kb:
+            return _grade_out_of_kb(answer)
         f1 = M.token_f1(answer, reference)
         if reference:
             score = 2.0 if f1 >= 0.75 else (1.0 if f1 >= 0.35 else 0.0)
@@ -205,6 +280,34 @@ def build_judge(llm_client: Any = None, mock: bool = False) -> Any:
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+
+
+def _grade_out_of_kb(answer: str) -> JudgeResult:
+    """Grade an out-of-knowledge-base question by *behaviour*.
+
+    The question has no reference answer: what matters is whether the
+    system refused (correct) or invented an answer (hallucination).  A
+    refusal is scored ``2`` (fully correct behaviour), an answer that
+    clearly invents content is scored ``0``.
+    """
+    refused = looks_like_refusal(answer)
+    if refused:
+        return JudgeResult(
+            score=2.0,
+            correct=True,
+            grounded=True,
+            supported_evidence_ids=[],
+            reason="out-of-KB: hệ thống từ chối trả lời (hành vi đúng)",
+            source="behaviour",
+        )
+    return JudgeResult(
+        score=0.0,
+        correct=False,
+        grounded=False,
+        supported_evidence_ids=[],
+        reason="out-of-KB: hệ thống cố trả lời câu hỏi ngoài phạm vi (hallucination)",
+        source="behaviour",
+    )
 
 
 def _evidence_id(evidence: Any) -> str:

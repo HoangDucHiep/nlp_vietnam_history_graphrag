@@ -87,6 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="số chunk tối đa dùng để sinh câu hỏi bằng LLM (default: 60)",
     )
     p.add_argument(
+        "--kg",
+        type=str,
+        default="neo4j",
+        help="nơi lấy entity của KG để dựng gold path (neo4j | inmemory | none)",
+    )
+    p.add_argument(
         "--samples",
         type=int,
         default=5,
@@ -114,6 +120,56 @@ def load_corpus(path: str | Path) -> list[Chunk]:
             except ValueError:
                 continue
     return chunks
+
+
+def load_kg_entities(store_kind: str) -> list:
+    """Read the entities of the knowledge graph (used for the gold paths).
+
+    The gold path of a question must consist of nodes that the knowledge
+    graph really has, otherwise the metric ``path_hit_rate`` penalises the
+    system for facts it could never retrieve.  The builder resolves the
+    mentioned names against this index (see
+    :meth:`hgrag.eval.dataset_builder.EvalDatasetBuilder._kg_path`).
+    """
+    if store_kind == "none":
+        return []
+    from hgrag.config import get_settings as _get_settings
+    from hgrag.data.records import Entity
+
+    settings = _get_settings()
+    try:
+        if store_kind == "inmemory":
+            from hgrag.kg.store import InMemoryGraphStore
+
+            store = InMemoryGraphStore()
+        else:
+            from hgrag.kg.store import Neo4jGraphStore
+
+            ncfg = settings.neo4j
+            store = Neo4jGraphStore(
+                uri=settings.neo4j_uri,
+                user=str(ncfg.get("user", "neo4j")),
+                password=settings.neo4j_password,
+                database=str(ncfg.get("database", "neo4j")),
+            )
+        props = store.list_entities()
+    except Exception as exc:  # noqa: BLE001 - the dataset can be built without the KG
+        logging.getLogger(__name__).warning("Không đọc được entity KG: %s", exc)
+        return []
+    out: list = []
+    for item in props:
+        entity = Entity(
+            uid=str(item.get("uid") or ""),
+            name=str(item.get("name") or ""),
+            entity_type=str(item.get("entity_type") or "Entity"),
+            aliases=list(item.get("aliases") or []),
+            name_key=str(item.get("name_key") or ""),
+            wikidata_id=str(item.get("wikidata_id") or ""),
+        )
+        if entity.name:
+            out.append(entity)
+    logging.getLogger(__name__).info("KG: %d entity dùng để dựng gold path", len(out))
+    return out
 
 
 def sample_payload(dataset: EvalDataset, n: int) -> list[dict[str, object]]:
@@ -205,6 +261,7 @@ def main(argv: list[str] | None = None) -> int:
         llm_client=llm,
         settings=settings,
         corpus_chunks=chunks,
+        kg_entities=load_kg_entities(args.kg),
         max_llm_chunks=args.max_llm_chunks,
     )
     dataset = builder.build(

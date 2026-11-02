@@ -354,8 +354,26 @@ def path_hit_rate(
 ) -> float:
     """Share of gold paths that appear among the retrieved paths.
 
-    A path is considered hit when the gold node sequence is a *subsequence*
-    of a retrieved path (same order, consecutive nodes not required).
+    A gold path is considered *hit* when its node sequence can be found in a
+    retrieved path.  The match is deliberately permissive:
+
+    * the gold nodes must appear **in order** (as a subsequence), but they
+      do not have to be adjacent;
+    * the direction is **symmetric** -- a gold path ``[agent, event]`` also
+      matches a retrieved path ``[event, agent]``.  The traversal of the
+      graph is directed, but the *gold* path of the evaluation set is
+      written from the question's point of view (anchor first), which is not
+      necessarily the direction of the edge that was traversed;
+    * the match is **substring based** -- a retrieved node that *contains*
+      the gold node counts as a hit (``"Đế Minh sinh ra Đế Nghi"`` contains
+      ``"Đế Minh"``).  The gold paths of the VHE template questions name
+      the arguments and the event node, and the event node is by
+      construction ``"<agent> <verb> <theme>"``.
+
+    >>> path_hit_rate([["A", "B"]], [["A", "B"]])
+    1.0
+    >>> path_hit_rate([["A", "B"]], [["B", "A"]])
+    1.0
     """
     gold_list = [list(p) for p in (gold_paths or []) if p]
     if not gold_list:
@@ -367,15 +385,54 @@ def path_hit_rate(
     hits = 0
     for gold_path in gold_list:
         target = [normalize_text(n) for n in gold_path]
-        found = False
-        for path in normalized:
-            it = iter(path)
-            if all(any(node == g for node in it) for g in target):
-                found = True
-                break
-        if found:
+        if not any(target):
+            continue
+        if any(_gold_path_found(target, path) for path in normalized):
             hits += 1
     return hits / len(gold_list)
+
+
+def _gold_path_found(target: Sequence[str], path: Sequence[str]) -> bool:
+    """Whether the gold node sequence ``target`` occurs in ``path``.
+
+    The search is performed in both directions and accepts a *substring*
+    match (the retrieved node may contain the gold node).
+    """
+    forward = _is_subsequence(target, path)
+    backward = _is_subsequence(list(reversed(target)), path)
+    return forward or backward
+
+
+def _is_subsequence(target: Sequence[str], path: Sequence[str]) -> bool:
+    """Whether every element of ``target`` occurs in ``path``, in order.
+
+    A path element matches a target element when they are equal or when the
+    path element contains the target element (substring match).  One path
+    element may satisfy **several** target elements: the event node of the
+    KG is ``"<agent> <verb> <theme>"`` and therefore contains both the agent
+    and the theme.
+    """
+    if not target:
+        return False
+    index = 0
+    for candidate in path:
+        if not candidate:
+            continue
+        # One path element can cover several consecutive target elements as
+        # long as all of them are contained in it (in any order is *not*
+        # allowed: the order must be preserved).
+        consumed = 0
+        while index + consumed < len(target):
+            wanted = target[index + consumed]
+            if wanted and wanted in candidate:
+                consumed += 1
+                continue
+            break
+        if consumed:
+            index += consumed
+            if index >= len(target):
+                return True
+    return False
 
 
 def temporal_accuracy(

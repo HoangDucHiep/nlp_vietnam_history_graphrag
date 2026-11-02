@@ -5,7 +5,13 @@ from __future__ import annotations
 import pytest
 
 from hgrag.eval.dataset import EvalDataset, EvalQuestion, load_jsonl
-from hgrag.eval.judge import HeuristicJudge, LLMJudge, build_judge
+from hgrag.eval.judge import (
+    HeuristicJudge,
+    LLMJudge,
+    build_judge,
+    is_out_of_kb,
+    looks_like_refusal,
+)
 from hgrag.eval.metrics import (
     aggregate,
     bootstrap_ci,
@@ -133,6 +139,23 @@ def test_path_hit_rate_matches_subsequence() -> None:
     assert path_hit_rate(gold, [["A", "X", "B", "C"]]) == 1.0
     assert path_hit_rate(gold, [["A", "B"]]) == 0.0
     assert path_hit_rate([], [["A"]]) == 0.0
+
+
+def test_path_hit_rate_is_symmetric() -> None:
+    """The direction of the traversed edge must not matter."""
+    gold = [["Đế Minh", "Đế Minh sinh ra Đế Nghi"]]
+    assert path_hit_rate(gold, [["Đế Minh sinh ra Đế Nghi", "Đế Minh"]]) == 1.0
+
+
+def test_path_hit_rate_matches_substring() -> None:
+    """A retrieved node that *contains* the gold node counts as a hit.
+
+    The VHE gold paths name the arguments and the event node; the event node
+    is by construction ``"<agent> <verb> <theme>"``.
+    """
+    gold = [["sinh ra Đế Nghi", "Đế Minh"]]
+    retrieved = [["Đế Minh sinh ra Đế Nghi"]]
+    assert path_hit_rate(gold, retrieved) == 1.0
 
 
 def test_temporal_accuracy() -> None:
@@ -276,6 +299,52 @@ def test_llm_judge_falls_back_to_heuristic_on_error() -> None:
 def test_build_judge_picks_heuristic_without_client() -> None:
     assert isinstance(build_judge(None), HeuristicJudge)
     assert isinstance(build_judge(object(), mock=True), HeuristicJudge)
+
+
+# --------------------------------------------------------------------------
+# out-of-KB behaviour rubric
+# --------------------------------------------------------------------------
+
+
+def test_is_out_of_kb_detects_question_type_and_source() -> None:
+    assert is_out_of_kb(EvalQuestion(qid="q1", question="q", question_type="out_of_kb"))
+    assert is_out_of_kb(EvalQuestion(qid="q2", question="q", source="out_of_kb"))
+    assert not is_out_of_kb(
+        EvalQuestion(qid="q3", question="q", question_type="single_hop", source="vhe_template")
+    )
+
+
+def test_looks_like_refusal() -> None:
+    assert looks_like_refusal(
+        "Tôi không tìm thấy đủ thông tin trong kho kiến thức để trả lời câu hỏi này."
+    )
+    assert looks_like_refusal("Câu hỏi này ngoài phạm vi kiến thức.")
+    assert not looks_like_refusal("Ngô Quyền đã đánh bại quân Nam Đô năm 938.")
+
+
+def test_out_of_kb_refusal_is_scored_correct() -> None:
+    """A refusal is the *correct* behaviour for an out-of-KB question."""
+    verdict = HeuristicJudge().grade(
+        question="q",
+        answer="Tôi không tìm thấy đủ thông tin trong kho kiến thức để trả lời câu hỏi này.",
+        reference="",
+        out_of_kb=True,
+    )
+    assert verdict.score == 2.0
+    assert verdict.correct
+    assert verdict.grounded
+
+
+def test_out_of_kb_answer_is_scored_as_hallucination() -> None:
+    verdict = HeuristicJudge().grade(
+        question="q",
+        answer="Thủ tướng hiện nay là ông Nguyễn Văn A.",
+        reference="",
+        out_of_kb=True,
+    )
+    assert verdict.score == 0.0
+    assert not verdict.correct
+    assert not verdict.grounded
 
 
 # --------------------------------------------------------------------------
