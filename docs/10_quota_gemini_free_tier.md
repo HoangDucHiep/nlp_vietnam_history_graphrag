@@ -124,6 +124,16 @@ nhịp theo token.
 Thinking budget is not supported for this model`), nên không thể tắt kênh suy
 luận; cách duy nhất là dành đủ ngân sách cho nó.
 
+## 4b. Prompt không sửa được vấn đề thinking của closed-book
+
+Bốn biến thể prompt (bỏ mục "## Suy luận", yêu cầu trả lời ≤ 3 câu, rút gọn
+system prompt, ép trả lời dứt câu) đều cho **cùng một kết quả**:
+`thoughts_token_count = 2045`, `text = ""`, `finish_reason = MAX_TOKENS` ở ngân
+sách 2048 (`scripts/_probe_prompt_variants.py`).  Kết luận: **nguyên nhân không
+nằm ở wording của prompt** mà ở chỗ mô hình không biết câu trả lời và suy luận
+vô hạn để tìm nó.  Cách khắc phục duy nhất là (a) `response_schema` (tắt hẳn kênh
+suy luận) hoặc (b) dành ngân sách lớn hơn — không phải sửa từ ngữ.
+
 ## 5. Tham số vận hành
 
 ```yaml
@@ -142,12 +152,74 @@ Embedder của lượt đánh giá được **ghim cố định** vào model c�
 Qdrant đã được index bằng vector 384 chiều (`chunks_local`, `chunks_vhe_local`)
 và quota embedding Gemini đã cạn.
 
-## 6. Cách tái lập các phép đo
+## 6. Lỗi chấm điểm: bộ lọc verdict tự mâu thuẫn (2026-11-02)
+
+### 6.1 Triệu chứng
+
+Sau khi sửa lỗi truy xuất VHE, hệ thống **"ours"** trả lời đúng câu
+`vhe_00001` (*"Đế Minh là người sinh ra Đế Nghi [E1], [E2]"*, đáp án tham chiếu
+*"Đế Minh"*), nhưng báo cáo ghi **sai** (`judge_correct = false`,
+`judge_degraded = true`, lý do `heuristic token-F1=0.364`).
+
+### 6.2 Nguyên nhân
+
+Hai lỗi độc lập trong `src/hgrag/eval/judge.py`:
+
+**(a) Bộ lọc `_is_self_consistent` loại oan verdict.**  Bản cũ tìm chuỗi khen
+(`"đúng về nghĩa"`, `"trả lời đúng"`, ...) trên **cả** chuỗi `reason`:
+
+| Lý do thật | Chứa cụm khen? | Bản cũ | Đúng ra |
+|---|---|---|---|
+| *"Đáp án ứng viên **không trả lời đúng** mốc liên hệ..."* | có | loại | **giữ** (là lý do *chê*) |
+| *"Thông tin ... là **đúng về nghĩa** nhưng sai chi tiết quan trọng."* | có | loại | **giữ** (bị `"nhưng"` lật ngược) |
+| *"Đáp án **đúng hoàn toàn** so với đáp án tham chiếu."* (`score=0`) | có | loại | loại (đúng) |
+
+Đo trên cache thật (1198 verdict): bản cũ loại **51** verdict, trong đó **31**
+là loại oan; bản mới loại **20** verdict, trong đó **0** loại oan.
+
+**(b) Lần chấm lại vô dụng vì `temperature=0`.**  Bản cũ chỉ đổi `task` (cache
+key) mà **không** đổi prompt, nên cùng một prompt luôn cho cùng một kết quả:
+ba lần thử trả về đúng ba payload giống hệt nhau.  Đo trực tiếp trên
+`vhe_00001` với CONTEXT thật:
+
+```
+lần 1: {"score": 0, "correct": false, ..., "reason": "Đáp án đúng hoàn toàn so với đáp án tham chiếu..."}
+lần 2: (giống hệt)
+lần 3: (giống hệt)
+⇒ rơi về heuristic token-F1 = 0.364 ⇒ báo cáo "sai"
+```
+
+### 6.3 Cách khắc phục
+
+1. `_is_self_consistent` làm việc trên **mệnh đề** (`_split_clauses`), không
+   phải trên cả chuỗi: phân biệt lý do *khen* với lý do *chê* bằng từ phủ định
+   (`không`, `chưa`, `sai`, `thiếu`) đứng trước cụm khen, và bằng từ nối đảo
+   chiều (`nhưng`, `tuy nhiên`, `song`) vô hiệu hoá mệnh đề khen.
+2. Lần chấm lại **đổi prompt** (thêm `JUDGE_RETRY_HINT`: chấm `score` trước,
+   viết `reason` khớp với điểm), không chỉ đổi cache key.
+
+Sau khi sửa, verdict của `vhe_00001` là
+`{"score": 2, "correct": true, "grounded": true, "supported_evidence_ids": ["E1","E2"]}`
+— đúng như rubric.
+
+### 6.4 Bài học
+
+Bộ lọc "loại verdict mâu thuẫn" **nguy hiểm khi heuristic dự phòng chặt hơn
+rubric**.  Trong trường hợp này, heuristic token-F1 yêu cầu F1 ≥ 0.75 mới coi
+là đúng, trong khi rubric LLM chấm theo *ngữ nghĩa*.  Rơi về heuristic ⇒ đáp án
+đúng bị báo cáo là sai.  Vì vậy bộ lọc phải **bảo thủ**: chỉ loại khi mâu thuẫn
+*không nghi ngờ* được, và lần chấm lại phải thực sự khác prompt.
+
+## 7. Cách tái lập các phép đo
 
 ```bash
 python scripts/_probe_thinking.py          # ngân sách output vs. token suy luận
 python scripts/_probe_closedbook_cause.py  # cô lập nguyên nhân prompt closed-book
 python scripts/_probe_closedbook_escape.py # tìm biến thể prompt kết thúc được
+python scripts/_probe_prompt_variants.py   # biến thể prompt: không sửa được thinking
+python scripts/_probe_judge_filter.py      # đo tác động của bản vá bộ lọc verdict
+python scripts/_probe_judge_retry.py        # kiểm chứng lần chấm lại đổi prompt
 python scripts/validate_thinking_fix.py    # kiểm chứng trên pipeline thật
 python scripts/13_prune_empty_cache.py     # dọn entry rỗng khỏi cache
+python scripts/14_rejudge_degraded.py --in-place  # chấm lại dòng judge_degraded
 ```

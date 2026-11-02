@@ -374,6 +374,169 @@ def test_llm_judge_rejects_a_self_contradictory_verdict() -> None:
     assert verdict.degraded is True
 
 
+def test_llm_judge_accepts_a_critique_containing_a_praise_phrase() -> None:
+    """Lý do *chê* chứa cụm khen không được bị loại.
+
+    Đây là hồi quy của lỗi đo được trên cache thật: `"Đáp án ứng viên **không
+    trả lời đúng** mốc liên hệ..."` chứa chuỗi `"trả lời đúng"`, nên bộ lọc
+    tìm chuỗi cũ coi là mâu thuẫn và loại verdict.  Hậu quả: dòng rơi về
+    heuristic token-F1 -- một heuristic *chặt hơn* rubric -- nên một đáp án
+    hoàn toàn đúng bị báo cáo là sai.
+    """
+
+    class _Critique:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_json(self, request):  # noqa: D102
+            self.calls += 1
+            return {
+                "score": 0,
+                "correct": False,
+                "grounded": True,
+                "supported_evidence_ids": [],
+                "reason": (
+                    "Đáp án ứng viên không trả lời đúng mốc liên hệ giữa Phú Điền "
+                    "và Bình theo tài liệu, mà đưa ra thông tin sai."
+                ),
+            }
+
+    client = _Critique()
+    verdict = LLMJudge(client, max_retries=3, retry_base_delay=0.0).grade(
+        question="q", answer="Trận Bạch Đằng", reference="Trận Bạch Đằng"
+    )
+    assert client.calls == 1
+    assert verdict.source == "llm"
+    assert verdict.degraded is False
+    assert verdict.score == 0.0
+
+
+def test_llm_judge_accepts_a_cancelled_praise_by_a_contrastive_clause() -> None:
+    """Lý do có mệnh đề khen bị từ nối đảo chiều lật ngược không mâu thuẫn.
+
+    *"Đáp án sai mốc thời gian 1416 thay vì 1418. Thông tin về Hội thề Lũng
+    Nhai là **đúng về nghĩa** nhưng sai chi tiết quan trọng."* -- điểm 0 là
+    đúng; mệnh đề khen đã bị `"nhưng"` vô hiệu hoá.
+    """
+
+    class _Cancelled:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_json(self, request):  # noqa: D102
+            self.calls += 1
+            return {
+                "score": 0,
+                "correct": False,
+                "grounded": True,
+                "supported_evidence_ids": [],
+                "reason": (
+                    "Đáp án sai mốc thời gian 1416 thay vì 1418. Thông tin về Hội "
+                    "thề Lũng Nhai là đúng về nghĩa nhưng sai chi tiết quan trọng."
+                ),
+            }
+
+    client = _Cancelled()
+    verdict = LLMJudge(client, max_retries=3, retry_base_delay=0.0).grade(
+        question="q", answer="Trận Bạch Đằng", reference="Trận Bạch Đằng"
+    )
+    assert client.calls == 1
+    assert verdict.source == "llm"
+    assert verdict.degraded is False
+
+
+def test_llm_judge_still_rejects_an_unqualified_praise_with_a_low_score() -> None:
+    """Mệnh đề khen *đứng độc lập* vẫn phải bị loại.
+
+    Đây là dạng mâu thuẫn thật: `"Đáp án đúng hoàn toàn so với đáp án tham
+    chiếu..."` với `score=0` (đo được trên `vhe_00001`).
+    """
+
+    class _Unqualified:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_json(self, request):  # noqa: D102
+            self.calls += 1
+            return {
+                "score": 0,
+                "correct": False,
+                "grounded": True,
+                "supported_evidence_ids": ["E1", "E2"],
+                "reason": (
+                    "Đáp án đúng hoàn toàn so với đáp án tham chiếu và gold facts. "
+                    "Thông tin được hỗ trợ bởi E1 và E2."
+                ),
+            }
+
+    client = _Unqualified()
+    verdict = LLMJudge(client, max_retries=3, retry_base_delay=0.0).grade(
+        question="q", answer="Trận Bạch Đằng", reference="Trận Bạch Đằng"
+    )
+    assert client.calls == 3
+    assert verdict.source == "heuristic"
+    assert verdict.degraded is True
+
+
+def test_split_clauses_keeps_the_critique_apart_from_the_praise() -> None:
+    """Tách mệnh đề phải giữ lại đủ ngữ cảnh để phân biệt khen và chê."""
+
+    from hgrag.eval.judge import _split_clauses
+
+    clauses = _split_clauses(
+        "Đáp án sai mốc thời gian 1416 thay vì 1418. Thông tin về Hội thề Lũng "
+        "Nhai là đúng về nghĩa nhưng sai chi tiết quan trọng."
+    )
+    assert any("đúng về nghĩa" in c for c in clauses)
+    assert any("sai chi tiết" in c for c in clauses)
+    # Mệnh đề khen không được nuốt mất từ nối đảo chiều.
+    assert not any("nhưng" in c.lower() for c in clauses)
+
+
+def test_llm_judge_retry_changes_the_prompt_not_only_the_cache_key() -> None:
+    """Lần chấm lại phải **đổi prompt**, không chỉ đổi cache key.
+
+    Với ``temperature=0`` cùng một prompt luôn cho cùng một kết quả, nên
+    nếu chỉ đổi ``task`` thì các lần thử trả về đúng những payload giống
+    hệt nhau (đo được trên ``vhe_00001``).  Đây là lý do ba lần thử trước đây
+    không giải quyết được verdict tự mâu thuẫn.
+    """
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def generate_json(self, request):  # noqa: D102
+            self.prompts.append(request.messages[-1].content)
+            # Lần đầu mâu thuẫn (khen nhưng điểm 0), các lần sau hợp lệ.
+            if len(self.prompts) == 1:
+                return {
+                    "score": 0,
+                    "correct": False,
+                    "grounded": True,
+                    "supported_evidence_ids": ["E1"],
+                    "reason": "Đáp án đúng hoàn toàn so với đáp án tham chiếu.",
+                }
+            return {
+                "score": 2,
+                "correct": True,
+                "grounded": True,
+                "supported_evidence_ids": ["E1"],
+                "reason": "Đáp án đúng và đầy đủ so với đáp án tham chiếu.",
+            }
+
+    client = _Recorder()
+    verdict = LLMJudge(client, max_retries=3, retry_base_delay=0.0).grade(
+        question="q", answer="Trận Bạch Đằng", reference="Trận Bạch Đằng"
+    )
+    assert len(client.prompts) == 2
+    assert client.prompts[0] != client.prompts[1]
+    assert verdict.source == "llm"
+    assert verdict.degraded is False
+    assert verdict.score == 2.0
+    assert verdict.correct is True
+
+
 def test_llm_judge_rejects_a_repetitive_reason() -> None:
     """Lý do lặp vòng là dấu hiệu mô hình hết ngân sách giữa chừng."""
 

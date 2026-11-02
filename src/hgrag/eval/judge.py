@@ -197,6 +197,20 @@ class JudgeResult:
         }
 
 
+#: Hướng dẫn bổ sung cho các lần chấm lại.  ``temperature=0`` khiến cùng một
+#: prompt luôn cho cùng một kết quả, nên chỉ đổi *cache key* là vô nghĩa: ba
+#: lần thử lại trả về đúng ba payload giống hệt nhau (đo được trên
+#: ``vhe_00001``).  Lần chấm lại phải **đổi prompt** thì mới có cơ hội ra một
+#: verdict khác.
+JUDGE_RETRY_HINT = """
+
+LƯU Ý CHO LẦN CHẤM LẠI: hãy chấm điểm `score` TRƯỚC, rồi viết `reason` khớp
+với điểm đã chấm. Nếu `score` = 0 thì `reason` phải nói đáp án sai / không
+đủ căn cứ; nếu `score` = 2 thì `reason` phải nói đáp án đúng và đầy đủ.
+`correct` phải đúng bằng (score >= 2).
+"""
+
+
 class LLMJudge:
     """Judge backed by an :class:`~hgrag.llm.client.LLMClient`."""
 
@@ -283,6 +297,11 @@ class LLMJudge:
         handles the per-minute quota internally (it waits and retries on the
         *same* model), so a failure here is a real one -- but a couple of
         retries still absorb the transient 500s of the free tier.
+
+        Mỗi lần chấm lại **đổi prompt** (thêm :data:`JUDGE_RETRY_HINT`), chứ
+        không chỉ đổi cache key: với ``temperature=0`` cùng một prompt luôn
+        cho cùng một kết quả, nên việc chỉ đổi ``task`` khiến cả ba lần thử
+        trả về đúng ba payload giống hệt nhau (đo được trên ``vhe_00001``).
         """
         if self.llm_client is None:
             return None
@@ -313,6 +332,13 @@ class LLMJudge:
                 # retry makes sure a *cached* bad verdict is not returned
                 # again and again (the same request would hit the cache).
                 request.task = "judge_answer" if attempt == 0 else f"judge_answer#{attempt}"
+                # Với temperature=0, cùng prompt cho cùng kết quả: lần chấm
+                # lại phải đổi nội dung prompt thì mới có cơ hội ra verdict
+                # khác (xem ``JUDGE_RETRY_HINT``).
+                request.messages[-1] = LLMMessage(
+                    role="user",
+                    content=prompt if attempt == 0 else prompt + JUDGE_RETRY_HINT,
+                )
                 payload = self.llm_client.generate_json(request)
             except Exception as exc:  # noqa: BLE001 - the judge must never crash the run
                 last_exc = exc
@@ -493,7 +519,60 @@ _PRAISE_MARKERS = (
     "trả lời đúng",
 )
 
+#: Cụm từ phủ định đi ngay **trước** cụm khen.  "không trả lời đúng" và
+#: "trả lời đúng" chứa cùng một chuỗi ký tự, nên nếu chỉ tìm chuỗi thì
+#: một lý do *chê* bị hiểu nhầm là lý do *khen* -- và ngược lại.
+_NEGATIONS = ("không", "chưa", "chẳng", "sai", "thiếu", "trượt", "lệch", "suy")
+
+#: Từ nối đảo chiều.  Khi lý do có dạng "đúng về nghĩa **nhưng** sai chi tiết
+#: quan trọng" thì mệnh đề đầu bị phủ định bởi mệnh đề sau: verdict vẫn nhất
+#: quán với ``score`` thấp.
+_CONTRASTIVE = ("nhưng", "tuy nhiên", "tuy ", "song", "dù", "mặc dù", "như")
+
+#: Mệnh đề khen đứng **độc lập** -- không bị từ nối đảo chiều bám vào.
+#: Chỉ những mệnh đề như vậy mới mâu thuẫn với một điểm thấp.
+_STANDALONE_PRAISE = ("đúng hoàn toàn", "đúng và đầy đủ", "đúng và chính xác")
+
 _SENTENCE_RE = re.compile(r"[^.!?]+[.!?]?")
+
+
+def _split_clauses(reason: str) -> list[str]:
+    """Chia lý do thành các mệnh đề con.
+
+    Mệnh đề được cắt theo dấu câu *và* theo từ nối đảo chiều, để một lý do
+    dạng "đúng về nghĩa nhưng sai chi tiết" được tách thành hai mệnh đề: một
+    mệnh đề khen, một mệnh đề chê.
+    """
+    clauses: list[str] = []
+    for sentence in _SENTENCE_RE.findall(reason):
+        parts = re.split(r"[,;]|\s+(?:nhưng|tuy nhiên|tuy|song|dù|mặc dù)\s+", sentence)
+        clauses.extend(p.strip() for p in parts if p.strip())
+    return clauses
+
+
+def _clause_praises(clause: str) -> bool:
+    """Whether a clause praises the candidate answer (on its own).
+
+    Chỉ coi mệnh đề là *khen* khi cụm khen **không** bị phủ định bởi từ đứng
+    ngay trước nó ("không trả lời đúng", "chưa đúng về nghĩa") và khi mệnh đề
+    không dùng từ nối đảo chiều.
+    """
+    lowered = clause.lower()
+    for marker in _PRAISE_MARKERS:
+        idx = lowered.find(marker)
+        if idx < 0:
+            continue
+        before = lowered[:idx]
+        # Từ phủ định ở cuối mệnh đề trước đó -> mệnh đề này bị phủ định.
+        tail = before[-30:]
+        if any(tail.endswith(neg) or f" {neg} " in tail for neg in _NEGATIONS):
+            continue
+        # "đúng về nghĩa ... nhưng sai" -> mệnh đề đầu bị mệnh đề sau lật ngược.
+        after = lowered[idx + len(marker) :]
+        if any(word in after for word in _CONTRASTIVE):
+            continue
+        return True
+    return False
 
 
 def _is_self_consistent(payload: dict[str, Any]) -> bool:
@@ -512,6 +591,23 @@ def _is_self_consistent(payload: dict[str, Any]) -> bool:
       is 2);
     * **degenerate repetition** -- the reason repeats the same sentence, the
       typical symptom of a model that ran out of budget mid-sentence.
+
+    The check works on **clauses**, not on the whole ``reason`` string.  A
+    naive substring search produces two kinds of false positives, both of
+    which were measured on the real cache (1272 verdicts):
+
+    * *"Đáp án ứng viên **không trả lời đúng** mốc liên hệ..."* -- the marker
+      ``"trả lời đúng"`` is present, but the clause is a **criticism**;
+    * *"Đáp án sai mốc thời gian 1416 thay vì 1418. Thông tin ... là **đúng về
+      nghĩa** nhưng sai chi tiết quan trọng."* -- the marker is present in a
+      clause that a contrastive conjunction cancels out.
+
+    Rejecting those verdicts sent the row to the token-F1 heuristic, which is
+    far stricter than the rubric: a perfect answer such as *"Đế Minh là người
+    sinh ra Đế Nghi"* scored 0.36 F1 and was therefore reported as **wrong**
+    (measured on ``vhe_00001``).  A clause-level check keeps the genuine
+    contradictions (score 0 + an unqualified praise clause) and lets the
+    contradictory ones through for a re-judgement.
     """
     reason = str(payload.get("reason") or "")
     if not reason.strip():
@@ -521,10 +617,18 @@ def _is_self_consistent(payload: dict[str, Any]) -> bool:
     except (TypeError, ValueError):
         return False
     lowered = reason.lower()
-    praise = any(marker in lowered for marker in _PRAISE_MARKERS)
-    if praise and score < 1.0:
-        return False
-    if not praise and score >= 2.0 and "sai" not in lowered:
+    clauses = _split_clauses(reason)
+    praises = [c for c in clauses if _clause_praises(c)]
+    if praises and score < 1.0:
+        # A low score is only contradicted when the praise is *unqualified*:
+        # "đúng hoàn toàn" praises the answer as a whole, while "đúng về nghĩa"
+        # may still be cancelled by a following criticism.
+        if any(
+            any(marker in clause.lower() for marker in _STANDALONE_PRAISE)
+            for clause in praises
+        ) or len(praises) == len(clauses):
+            return False
+    if not praises and score >= 2.0 and "sai" not in lowered:
         # A perfect score without any praise in the reason is suspicious but
         # not contradictory on its own -- it is allowed.
         pass
