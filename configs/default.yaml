@@ -47,7 +47,12 @@ llm:
   fallback_embed_models:
     - gemini-embedding-2-preview
   temperature: 0.0
-  max_output_tokens: 2048
+  # Ngân sách token **output**.  Gemma 4 tính token suy luận (thinking) vào
+  # `max_output_tokens`: nếu ngân sách quá nhỏ, toàn bộ ngân sách bị suy
+  # luận ăn hết và phần trả lời trả về rỗng (`finish_reason=MAX_TOKENS`).
+  # Đo đạc thực nghiệm: suy luận cần 250–1 100 token cho câu có CONTEXT.
+  # Xem docs/10_quota_gemini_free_tier.md.
+  max_output_tokens: 4096
   request_timeout: 120
   max_retries: 4
   retry_base_delay: 2.0

@@ -398,6 +398,32 @@ class GeminiClient(LLMClient):
         self._shared_token_limiters: dict[str, SharedTokenLimiter] = {}
 
     # -- helpers ---------------------------------------------------------
+    @staticmethod
+    def _is_thinking_overrun(resp: Any) -> bool:
+        """Whether the response was cut because thinking ate the budget.
+
+        Gemma 4 counts the *reasoning* tokens against ``max_output_tokens``.
+        When the reasoning does not terminate, the API answers with
+        ``finish_reason=MAX_TOKENS`` and an empty ``text``: the answer is lost
+        even though the call succeeded.  Measured in docs/10.
+        """
+        candidates = getattr(resp, "candidates", None) or []
+        for cand in candidates:
+            reason = str(getattr(cand, "finish_reason", "") or "")
+            if "MAX_TOKENS" in reason:
+                return True
+        return False
+
+    @staticmethod
+    def _expanded_output_budget(current: int) -> int:
+        """The budget to retry with when thinking overran ``current``.
+
+        The measured thinking length of the Gemma family is 250–1 100 tokens
+        for a question it can answer and unbounded for one it cannot, so the
+        retry doubles the budget up to 8 192 tokens.
+        """
+        return min(8192, max(1, int(current)) * 2)
+
     def _cache_key(self, request: LLMRequest) -> str:
         # The *primary* model is part of the key: when the model of the run
         # changes (e.g. from Gemini to Gemma because the Gemini free-tier
@@ -599,6 +625,34 @@ class GeminiClient(LLMClient):
                     resp = self._client.models.generate_content(**kwargs)
                     text = getattr(resp, "text", "") or ""
                     usage = getattr(resp, "usage_metadata", None)
+                    # Gemma 4 (và các model suy luận khác) tính token suy
+                    # luận vào `max_output_tokens`.  Khi phần suy luận dùng hết
+                    # ngân sách, API trả `finish_reason=MAX_TOKENS` với `text`
+                    # **rỗng** -- câu trả lời bị mất hoàn toàn.  Đo đạc ở
+                    # docs/10 cho thấy đây là nguyên nhân 65/110 câu closed-book
+                    # rỗng.  Ta phát hiện tình huống này và **thử lại với
+                    # ngân sách lớn hơn** trước khi bỏ cuộc.
+                    if not text.strip() and self._is_thinking_overrun(resp):
+                        retry_budget = self._expanded_output_budget(
+                            request.max_output_tokens or self.max_output_tokens
+                        )
+                        if retry_budget > (request.max_output_tokens or self.max_output_tokens):
+                            logger.warning(
+                                "Mô hình %s hết ngân sách token khi suy luận "
+                                "(text rỗng) -- thử lại với max_output_tokens=%d",
+                                model_name,
+                                retry_budget,
+                            )
+                            config = {**config, "max_output_tokens": retry_budget}
+                            kwargs = {"model": model_name, "contents": prompt}
+                            kwargs["config"] = (
+                                {**config, "system_instruction": system}
+                                if system
+                                else config
+                            )
+                            resp = self._client.models.generate_content(**kwargs)
+                            text = getattr(resp, "text", "") or ""
+                            usage = getattr(resp, "usage_metadata", None)
                     payload = {
                         "text": text,
                         "model": model_name,

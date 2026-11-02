@@ -712,3 +712,67 @@ class TestGeminiClientRateLimitHandling:
         a = GeminiClient(model="model-a", api_key="k", cache_dir=tmp_path / "cache")
         b = GeminiClient(model="model-b", api_key="k", cache_dir=tmp_path / "cache")
         assert a._cache_key(_req("judge")) != b._cache_key(_req("judge"))
+
+
+# --------------------------------------------------------------------------
+# Gemma: suy luận ăn hết ngân sách output
+# --------------------------------------------------------------------------
+
+
+def _thinking_overrun_response() -> SimpleNamespace:
+    """Mô phỏng câu trả lời bị cắt vì token suy luận dùng hết ngân sách."""
+    return SimpleNamespace(
+        text="",
+        candidates=[SimpleNamespace(finish_reason="FinishReason.MAX_TOKENS")],
+        usage_metadata=SimpleNamespace(prompt_token_count=100, candidates_token_count=None),
+    )
+
+
+class TestGeminiThinkingOverrun:
+    """Gemma 4 tính token suy luận vào `max_output_tokens`.
+
+    Khi phần suy luận không kết thúc, API trả ``text`` rỗng và
+    ``finish_reason=MAX_TOKENS``: câu trả lời bị mất hoàn toàn.  Client phải
+    phát hiện tình huống này và thử lại với ngân sách lớn hơn.
+    """
+
+    def test_detects_max_tokens_finish_reason(self):
+        assert GeminiClient._is_thinking_overrun(_thinking_overrun_response()) is True
+
+    def test_normal_response_is_not_an_overrun(self):
+        resp = SimpleNamespace(
+            text="ok",
+            candidates=[SimpleNamespace(finish_reason="FinishReason.STOP")],
+            usage_metadata=SimpleNamespace(prompt_token_count=10, candidates_token_count=5),
+        )
+        assert GeminiClient._is_thinking_overrun(resp) is False
+
+    def test_expanded_budget_doubles_and_caps(self):
+        assert GeminiClient._expanded_output_budget(256) == 512
+        assert GeminiClient._expanded_output_budget(2048) == 4096
+        assert GeminiClient._expanded_output_budget(4096) == 8192
+        assert GeminiClient._expanded_output_budget(8192) == 8192
+
+    def test_retries_with_a_larger_budget(self, monkeypatch, tmp_path: Path):
+        models = _install_fake_genai(
+            monkeypatch,
+            lambda kwargs: (
+                _thinking_overrun_response()
+                if len(models.calls) == 1
+                else _ok_response("câu trả lời")
+            ),
+        )
+        client = GeminiClient(model="gemini-test", api_key="k", cache_dir=tmp_path / "cache")
+        resp = client.generate(_req("judge"))
+        assert resp.text == "câu trả lời"
+        assert len(models.calls) == 2
+        first_budget = models.calls[0]["config"]["max_output_tokens"]
+        second_budget = models.calls[1]["config"]["max_output_tokens"]
+        assert second_budget == first_budget * 2
+
+    def test_does_not_retry_when_the_answer_is_present(self, monkeypatch, tmp_path: Path):
+        models = _install_fake_genai(monkeypatch, lambda kwargs: _ok_response("ok"))
+        client = GeminiClient(model="gemini-test", api_key="k", cache_dir=tmp_path / "cache")
+        resp = client.generate(_req("judge"))
+        assert resp.text == "ok"
+        assert len(models.calls) == 1

@@ -24,7 +24,12 @@ class LLMRequest:
     messages: list[LLMMessage]
     model: str = ""
     temperature: float = 0.0
-    max_output_tokens: int = 2048
+    #: Output-token budget.  ``0`` means "use the budget of the client"
+    #: (``llm.max_output_tokens`` in the configuration).  The Gemma family
+    #: counts its *reasoning* tokens against this budget, so a value that is
+    #: too small makes the model return an **empty** answer; see
+    #: docs/10_quota_gemini_free_tier.md.
+    max_output_tokens: int = 0
     response_schema: dict[str, Any] | None = None
     response_mime_type: str | None = None
     task: str = "general"  # used as cache namespace

@@ -342,6 +342,120 @@ def test_llm_judge_retries_before_falling_back() -> None:
     assert verdict.score == 2.0
 
 
+def test_llm_judge_rejects_a_self_contradictory_verdict() -> None:
+    """Verdict tự mâu thuẫn (lý do khen nhưng điểm = 0) phải bị loại.
+
+    Gemma thỉnh thoảng trả về `score=0` kèm lý do "Đáp án đúng về nghĩa và
+    đầy đủ...".  Verdict như vậy không thể tin: nó đưa một đáp án đúng vào
+    nhóm "sai" của báo cáo.  Judge phải chấm lại, và chỉ khi mọi lần đều
+    mâu thuẫn thì mới rơi về heuristic (đánh dấu ``degraded``).
+    """
+
+    class _Contradictory:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_json(self, request):  # noqa: D102
+            self.calls += 1
+            return {
+                "score": 0,
+                "correct": False,
+                "grounded": True,
+                "supported_evidence_ids": ["E1"],
+                "reason": "Đáp án đúng về nghĩa và đầy đủ so với đáp án tham chiếu.",
+            }
+
+    client = _Contradictory()
+    verdict = LLMJudge(client, max_retries=3, retry_base_delay=0.0).grade(
+        question="q", answer="Trận Bạch Đằng", reference="Trận Bạch Đằng"
+    )
+    assert client.calls == 3
+    assert verdict.source == "heuristic"
+    assert verdict.degraded is True
+
+
+def test_llm_judge_rejects_a_repetitive_reason() -> None:
+    """Lý do lặp vòng là dấu hiệu mô hình hết ngân sách giữa chừng."""
+
+    class _Repetitive:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_json(self, request):  # noqa: D102
+            self.calls += 1
+            return {
+                "score": 2,
+                "correct": True,
+                "grounded": True,
+                "supported_evidence_ids": ["E1"],
+                "reason": (
+                    "Đáp án ứng viên là một câu hoàn chỉnh. "
+                    "Đáp án ứng viên là một câu câu hoàn chỉnh. "
+                    "Đáp án ứng viên là một câu hoàn chỉnh."
+                ),
+            }
+
+    client = _Repetitive()
+    verdict = LLMJudge(client, max_retries=2, retry_base_delay=0.0).grade(
+        question="q", answer="Trận Bạch Đằng", reference="Trận Bạch Đằng"
+    )
+    assert client.calls == 2
+    assert verdict.source == "heuristic"
+    assert verdict.degraded is True
+
+
+def test_llm_judge_accepts_a_consistent_verdict() -> None:
+    """Verdict nhất quán phải được giữ nguyên (không chấm lại)."""
+
+    class _Consistent:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_json(self, request):  # noqa: D102
+            self.calls += 1
+            return {
+                "score": 2,
+                "correct": True,
+                "grounded": True,
+                "supported_evidence_ids": ["E1"],
+                "reason": "Đáp án đúng về nghĩa và đầy đủ so với đáp án tham chiếu.",
+            }
+
+    client = _Consistent()
+    verdict = LLMJudge(client, max_retries=3, retry_base_delay=0.0).grade(
+        question="q", answer="Trận Bạch Đằng", reference="Trận Bạch Đằng"
+    )
+    assert client.calls == 1
+    assert verdict.source == "llm"
+    assert verdict.score == 2.0
+    assert verdict.degraded is False
+
+
+def test_llm_judge_vary_the_task_on_retry() -> None:
+    """Lần chấm lại phải dùng cache key khác, nếu không cache sẽ trả lại
+    verdict hỏng cũ."""
+
+    class _Tracking:
+        def __init__(self) -> None:
+            self.tasks: list[str] = []
+
+        def generate_json(self, request):  # noqa: D102
+            self.tasks.append(request.task)
+            return {
+                "score": 2,
+                "correct": True,
+                "grounded": True,
+                "supported_evidence_ids": [],
+                "reason": "ok",
+            }
+
+    client = _Tracking()
+    LLMJudge(client, max_retries=3, retry_base_delay=0.0).grade(
+        question="q", answer="a", reference="a"
+    )
+    assert client.tasks == ["judge_answer"]
+
+
 def test_build_judge_picks_heuristic_without_client() -> None:
     assert isinstance(build_judge(None), HeuristicJudge)
     assert isinstance(build_judge(object(), mock=True), HeuristicJudge)

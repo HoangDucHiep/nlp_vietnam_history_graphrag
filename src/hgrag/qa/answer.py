@@ -66,13 +66,23 @@ Hãy trả lời theo quy tắc ở trên.
 #: Prompt của baseline **B0 (closed-book)**: không có CONTEXT, mô hình phải
 #: trả lời bằng kiến thức tham số của chính nó.  Đây là baseline bắt buộc
 #: theo docs/04 §4.1 (B0 = LLM-only, "chỉ kiến thức mô hình").
+#:
+#: Đo đạc (`scripts/_probe_closedbook_escape.py`, xem docs/10) cho thấy Gemma 4
+#: **không kết thúc** phần suy luận khi được hỏi một câu mà nó không biết:
+#: token suy luận dùng hết toàn bộ ngân sách (256 → 8192) và phần trả lời
+#: trả về **rỗng**.  Nguyên nhân là bản prompt cũ *không* nói rằng "không
+#: biết" là một câu trả lời hợp lệ -- mô hình cứ suy luận để tìm câu trả lời
+#: mà không tồn tại.  Vì vậy prompt mới cho mô hình một **lối thoát** rõ
+#: ràng, đồng thời giữ nguyên ngữ nghĩa của baseline: không CONTEXT, không
+#: trích dẫn, không bịa đặt.
 CLOSED_BOOK_SYSTEM_PROMPT = """Bạn là chuyên gia lịch sử Việt Nam. Bạn trả lời câu hỏi dựa trên KIẾN THỨC CỦA CHÍNH BẠN (closed-book), không có tài liệu tham chiếu nào được cung cấp.
 
 Quy tắc bắt buộc:
 1. Trả lời trực tiếp, súc tích, bằng tiếng Việt, đúng mốc thời gian và địa danh.
 2. KHÔNG gắn trích dẫn [E#] vì không có nguồn nào được cung cấp.
-3. Nếu bạn không chắc chắn về câu trả lời, hãy nói rõ rằng bạn không chắc chắn thay vì bịa đặt chi tiết.
-4. Kết thúc bằng một mục "## Suy luận" gồm các bước suy luận đánh số (1., 2., 3.) ngắn gọn.
+3. Nếu bạn KHÔNG CHẮC CHẮN hoặc không biết, hãy trả lời đúng câu: "Tôi không tìm thấy đủ thông tin trong kho kiến thức để trả lời câu hỏi này." Đây là một câu trả lời HỢP LỆ, không phải lỗi.
+4. KHÔNG suy luận dài, KHÔNG tự hỏi lại người dùng. Chỉ viết câu trả lời cuối cùng.
+5. Kết thúc bằng một mục "## Suy luận" gồm các bước suy luận đánh số (1., 2., 3.) ngắn gọn.
 """
 
 CLOSED_BOOK_USER_TEMPLATE = """CÂU HỎI: {question}

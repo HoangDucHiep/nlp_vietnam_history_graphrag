@@ -297,16 +297,22 @@ class LLMJudge:
             task="judge_answer",
             temperature=0.0,
             response_schema=JUDGE_SCHEMA,
-            # The verdict only needs a handful of fields.  A small budget keeps
-            # the model from degenerating into a repetition loop: Gemma
-            # sometimes repeats a phrase until the token budget of the
-            # request is exhausted, and the response is then truncated in the
-            # middle of the JSON.
-            max_output_tokens=256,
+            # The verdict only needs a handful of fields.  The budget is kept
+            # small on purpose: with a ``response_schema`` the Gemini API
+            # enforces the schema and **does not** run the model's reasoning
+            # channel, so the whole budget is available for the JSON body
+            # (measured in docs/10_quota_gemini_free_tier.md).  Without the
+            # schema, Gemma would spend the budget on reasoning and the
+            # response would come back empty.
+            max_output_tokens=512,
         )
         last_exc: Exception | None = None
         for attempt in range(self.max_retries):
             try:
+                # The ``task`` is part of the cache key.  Varying it on a
+                # retry makes sure a *cached* bad verdict is not returned
+                # again and again (the same request would hit the cache).
+                request.task = "judge_answer" if attempt == 0 else f"judge_answer#{attempt}"
                 payload = self.llm_client.generate_json(request)
             except Exception as exc:  # noqa: BLE001 - the judge must never crash the run
                 last_exc = exc
@@ -324,6 +330,18 @@ class LLMJudge:
                 logger.warning("Judge thất bại (%s) -> dùng heuristic", exc)
                 return None
             if isinstance(payload, dict):
+                if not _is_self_consistent(payload):
+                    # The verdict contradicts itself (see the helper): the
+                    # score cannot be trusted, so the row is judged again.
+                    logger.warning(
+                        "Judge trả về payload tự mâu thuẫn (lần %d/%d) -- thử lại",
+                        attempt + 1,
+                        self.max_retries,
+                    )
+                    if attempt + 1 < self.max_retries:
+                        time.sleep(self.retry_base_delay * (2**attempt))
+                        continue
+                    return None
                 return payload
             logger.info("Judge trả về payload không phải dict -> thử lại")
         _ = last_exc
@@ -463,3 +481,59 @@ def _json_or_none(text: str) -> dict[str, Any] | None:
     except ValueError:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+#: Phrases with which the judge *praises* the candidate answer.
+_PRAISE_MARKERS = (
+    "đúng về nghĩa",
+    "đúng hoàn toàn",
+    "đúng và đầy đủ",
+    "đúng và chính xác",
+    "chính xác và đầy đủ",
+    "trả lời đúng",
+)
+
+_SENTENCE_RE = re.compile(r"[^.!?]+[.!?]?")
+
+
+def _is_self_consistent(payload: dict[str, Any]) -> bool:
+    """Whether a judge verdict is internally consistent.
+
+    Gemma occasionally emits a verdict that contradicts itself: the ``reason``
+    praises the answer ("Đáp án đúng về nghĩa và đầy đủ...") while ``score``
+    is ``0`` -- measured on 4 of 471 cached verdicts (0.85 %).  Such a verdict
+    cannot be used: it would silently put a correct answer into the "wrong"
+    bucket of the report.
+
+    Two kinds of defect are detected:
+
+    * **self-contradiction** -- the reason praises the answer but the score is
+      below 1 (or the other way round: the reason condemns it but the score
+      is 2);
+    * **degenerate repetition** -- the reason repeats the same sentence, the
+      typical symptom of a model that ran out of budget mid-sentence.
+    """
+    reason = str(payload.get("reason") or "")
+    if not reason.strip():
+        return False
+    try:
+        score = float(payload.get("score", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    lowered = reason.lower()
+    praise = any(marker in lowered for marker in _PRAISE_MARKERS)
+    if praise and score < 1.0:
+        return False
+    if not praise and score >= 2.0 and "sai" not in lowered:
+        # A perfect score without any praise in the reason is suspicious but
+        # not contradictory on its own -- it is allowed.
+        pass
+    # Degenerate repetition: the same sentence appears at least twice.
+    sentences = [s.strip().lower() for s in _SENTENCE_RE.findall(reason) if len(s.strip()) > 12]
+    if sentences:
+        counts: dict[str, int] = {}
+        for sentence in sentences:
+            counts[sentence] = counts.get(sentence, 0) + 1
+        if max(counts.values()) >= 2:
+            return False
+    return True
