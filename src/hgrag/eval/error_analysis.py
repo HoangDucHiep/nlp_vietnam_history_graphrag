@@ -32,6 +32,7 @@ ERROR_TYPES: tuple[str, ...] = (
     "out_of_kb_hallucination",
     "refused_when_answerable",
     "citation_invalid",
+    "bad_question",
     "other",
 )
 
@@ -44,6 +45,7 @@ ERROR_LABELS: dict[str, str] = {
     "out_of_kb_hallucination": "Bịa ở câu ngoài KB",
     "refused_when_answerable": "Từ chối nhầm câu trả lời được",
     "citation_invalid": "Trích dẫn không hợp lệ",
+    "bad_question": "Câu hỏi lỗi (ngoài KB / sai lệch)",
     "other": "Lỗi khác",
 }
 
@@ -56,24 +58,75 @@ ERROR_ROOTS: dict[str, str] = {
     "out_of_kb_hallucination": "Thiếu cơ chế từ chối khi không có evidence",
     "refused_when_answerable": "Ngân sách context quá chặt / evidence bị lọc hết",
     "citation_invalid": "Mô hình sinh [E#] không tồn tại / evidence thiếu text",
+    "bad_question": "Câu hỏi tự nó sai lệch lịch sử hoặc nằm ngoài phạm vi kho",
     "other": "Cần xem thủ công",
 }
 
+#: Những cụm từ trong ``judge_reason`` cho thấy **câu hỏi** (không phải hệ
+#: thống) là nguyên nhân của lỗi: ví dụ câu hỏi ghép một sự kiện đầu thế kỷ XX
+#: vào bối cảnh triều Trần, hoặc hỏi về một thông tin kho không có.
+_BAD_QUESTION_MARKERS = (
+    "câu hỏi sai",
+    "câu hỏi không hợp lệ",
+    "sai lệch lịch sử",
+    "không tồn tại trong kho",
+    "ngoài phạm vi kho",
+    "câu hỏi mơ hồ",
+)
+
+#: Những cụm từ cho thấy judge chỉ ra rằng **đáp án** có thêm thông tin không
+#: có trong CONTEXT -> lỗi *sinh*, không phải lỗi *truy xuất*.
+_UNGROUNDED_ANSWER_MARKERS = (
+    "không có trong context",
+    "không được hỗ trợ bởi context",
+    "bịa đặt",
+    "không xuất hiện trong context",
+)
+
+
+def _reason_says_bad_question(reason: str) -> bool:
+    """Whether the judge blamed the *question* for the failure."""
+    lowered = (reason or "").lower()
+    return any(marker in lowered for marker in _BAD_QUESTION_MARKERS)
+
+
+def _reason_says_ungrounded_answer(reason: str) -> bool:
+    """Whether the judge blamed the *answer* for unsupported claims."""
+    lowered = (reason or "").lower()
+    return any(marker in lowered for marker in _UNGROUNDED_ANSWER_MARKERS)
+
 
 def classify_error(row: EvalRow, question_type: str = "") -> str:
-    """Classify one failed answer into an error category."""
+    """Classify one failed answer into an error category.
+
+    The classification combines three kinds of signal:
+
+    * the *behaviour* of the system (refused / answered / cited),
+    * the *retrieval* metrics of the row (evidence, entity recall, path hit),
+    * the *reason* given by the judge, which sometimes blames the question
+      itself instead of the system (docs/04 §5.4).
+    """
     markers = M.extract_citation_markers(row.answer)
     has_evidence = row.n_evidence > 0
     chunk_recall = row.chunk_recall_at_10
+    reason = row.judge_reason or ""
 
     if question_type == "out_of_kb" and not row.refused and row.answer:
         return "out_of_kb_hallucination"
+    if _reason_says_bad_question(reason):
+        # The judge explicitly says the *question* is wrong / out of scope:
+        # penalising the system for that would be unfair.
+        return "bad_question"
     if row.refused and question_type != "out_of_kb":
         return "refused_when_answerable"
     if markers and not row.citation_precision:
         return "citation_invalid"
     if not has_evidence:
         return "missing_evidence"
+    if _reason_says_ungrounded_answer(reason):
+        # Evidence was there but the answer added claims the context does not
+        # support -- a generation problem, not a retrieval problem.
+        return "generation_wrong_despite_evidence"
     if chunk_recall < 0.5 and row.path_hit == 0:
         # gold chunk không có trong top-k và không tìm được đường đi
         return "missing_evidence" if row.entity_recall < 0.5 else "wrong_path"

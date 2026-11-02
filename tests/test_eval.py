@@ -936,3 +936,80 @@ def test_checkpoint_resume_keeps_previous_rows(tmp_path) -> None:
         skip_existing=False,
     )
     assert len(run.rows) == 2
+
+
+# --------------------------------------------------------------------------
+# error analysis
+# --------------------------------------------------------------------------
+
+
+def _row(**kwargs) -> EvalRow:
+    base = {
+        "qid": "q1",
+        "system": "ours",
+        "question": "Câu hỏi?",
+        "question_type": "single_hop",
+        "answer": "Một câu trả lời có dẫn chiếu [E1].",
+        "judge_correct": False,
+        "judge_score": 0.0,
+        "n_evidence": 3,
+        "n_citations": 1,
+        "citation_precision": 1.0,
+        "chunk_recall_at_10": 1.0,
+        "entity_recall": 1.0,
+        "path_hit": 1.0,
+    }
+    base.update(kwargs)
+    return EvalRow(**base)
+
+
+def test_classify_error_detects_refusal_on_answerable_question() -> None:
+    from hgrag.eval.error_analysis import classify_error
+
+    row = _row(refused=True, answer="Tôi không tìm thấy đủ thông tin trong kho.")
+    assert classify_error(row, "single_hop") == "refused_when_answerable"
+
+
+def test_classify_error_detects_out_of_kb_hallucination() -> None:
+    from hgrag.eval.error_analysis import classify_error
+
+    row = _row(answer="Năm 1945, Việt Nam độc lập.", refused=False)
+    assert classify_error(row, "out_of_kb") == "out_of_kb_hallucination"
+
+
+def test_classify_error_blames_the_question_when_the_judge_does() -> None:
+    from hgrag.eval.error_analysis import classify_error
+
+    row = _row(
+        judge_reason="Câu hỏi ghép các sự kiện đầu thế kỷ XX vào bối cảnh triều Trần là sai lệch lịch sử.",
+    )
+    assert classify_error(row, "single_hop") == "bad_question"
+
+
+def test_classify_error_detects_ungrounded_answer() -> None:
+    from hgrag.eval.error_analysis import classify_error
+
+    row = _row(judge_reason="Đáp án chứa nhiều thông tin không có trong CONTEXT.")
+    assert classify_error(row, "single_hop") == "generation_wrong_despite_evidence"
+
+
+def test_classify_error_detects_missing_evidence() -> None:
+    from hgrag.eval.error_analysis import classify_error
+
+    row = _row(n_evidence=0, answer="Không có gì.", n_citations=0)
+    assert classify_error(row, "single_hop") == "missing_evidence"
+
+
+def test_analyze_errors_counts_categories() -> None:
+    from hgrag.eval.error_analysis import analyze_errors
+    from hgrag.eval.run_eval import EvalRun
+
+    rows = [
+        _row(qid="a", refused=True, answer="Tôi không tìm thấy đủ thông tin trong kho."),
+        _row(qid="b", judge_reason="Câu hỏi sai lệch lịch sử."),
+    ]
+    run = EvalRun(rows=rows, meta={})
+    analysis = analyze_errors(run, "ours")
+    assert analysis["n_failures"] == 2
+    assert analysis["counts"]["refused_when_answerable"] == 1
+    assert analysis["counts"]["bad_question"] == 1
