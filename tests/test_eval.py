@@ -296,6 +296,52 @@ def test_llm_judge_falls_back_to_heuristic_on_error() -> None:
     assert verdict.source == "heuristic"
 
 
+def test_llm_judge_degraded_flag_is_set_on_fallback() -> None:
+    """Khi rơi về heuristic, dòng đó phải được đánh dấu là *degraded*.
+
+    Nếu không, bảng so sánh sẽ trộn điểm token-F1 với điểm chấm LLM và
+    kết luận trở nên vô nghĩa.
+    """
+
+    class _Broken:
+        def generate_json(self, request):  # noqa: D102
+            raise RuntimeError("boom")
+
+    verdict = LLMJudge(_Broken(), max_retries=1, retry_base_delay=0.0).grade(
+        question="q", answer="Trận Bạch Đằng", reference="Trận Bạch Đằng"
+    )
+    assert verdict.degraded is True
+
+
+def test_llm_judge_retries_before_falling_back() -> None:
+    """Một lần gọi hỏng (429 tạm thời) không được làm hỏng cả lượt chấm."""
+
+    class _Flaky:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_json(self, request):  # noqa: D102
+            self.calls += 1
+            if self.calls < 3:
+                raise RuntimeError("429 tạm thời")
+            return {
+                "score": 2,
+                "correct": True,
+                "grounded": True,
+                "supported_evidence_ids": ["E1"],
+                "reason": "ok",
+            }
+
+    client = _Flaky()
+    verdict = LLMJudge(client, max_retries=3, retry_base_delay=0.0).grade(
+        question="q", answer="Trận Bạch Đằng", reference="Trận Bạch Đằng"
+    )
+    assert client.calls == 3
+    assert verdict.source == "llm"
+    assert verdict.degraded is False
+    assert verdict.score == 2.0
+
+
 def test_build_judge_picks_heuristic_without_client() -> None:
     assert isinstance(build_judge(None), HeuristicJudge)
     assert isinstance(build_judge(object(), mock=True), HeuristicJudge)

@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from ..data.records import stable_hash
-from .rate_limit import SharedRateLimiter
+from .rate_limit import SharedRateLimiter, SharedTokenLimiter
 from .schemas import LLMMessage, LLMRequest, LLMResponse
 
 _YEAR_RE = re.compile(r"\b(9\d{2}|1[0-9]{3})\b")
@@ -80,22 +80,177 @@ class LLMClient:
     def generate(self, request: LLMRequest) -> LLMResponse:  # pragma: no cover - interface
         raise NotImplementedError
 
+    @staticmethod
+    def _extract_json(text: str) -> str | None:
+        """Recover a JSON object from a response that is not pure JSON.
+
+        Small models do not always honour the structured-output contract:
+        they may wrap the JSON in prose or in a markdown fence, and a
+        truncated response may cut the object in the middle of a string.
+        Three repairs are applied, in this order:
+
+        1. strip a markdown fence / the surrounding prose;
+        2. cut the object at its **last complete top-level pair** and close
+           the braces -- this keeps the fields that were written entirely
+           (the rubric fields come first, so they survive);
+        3. if the object was cut in the middle of a string, close the string
+           first.
+
+        The result is returned as ``None`` when nothing can be recovered.
+        """
+        if not text:
+            return None
+        candidate = text.strip()
+        if candidate.startswith("```"):
+            parts = candidate.split("```")
+            candidate = parts[1] if len(parts) > 1 else candidate
+            if candidate.lower().startswith("json"):
+                candidate = candidate[4:]
+            candidate = candidate.strip()
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            pass
+        # Find the outermost JSON object and repair a truncated tail.
+        start = candidate.find("{")
+        if start == -1:
+            return None
+        body = candidate[start:]
+        end = LLMClient._scan_object_end(body)
+        if end is not None:
+            snippet = body[: end + 1]
+            try:
+                json.loads(snippet)
+                return snippet
+            except json.JSONDecodeError:
+                pass
+        return LLMClient._repair_truncated_object(body)
+
+    @staticmethod
+    def _repair_truncated_object(body: str) -> str | None:
+        """Repair an object that was cut short.
+
+        The object is cut at the end of its last **complete** top-level
+        key/value pair; the open braces are then closed.  A field that was
+        only partially written (``"reason": "cắt ngang...``) is dropped
+        instead of being guessed.
+        """
+        depth = 0
+        in_string = False
+        escaped = False
+        # The index just after the last complete top-level pair.
+        last_complete = -1
+        for index, char in enumerate(body):
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char in "{[":
+                depth += 1
+                continue
+            if char in "}]":
+                depth -= 1
+                continue
+            if char == "," and depth == 1:
+                # The pair before the comma is complete.
+                last_complete = index
+        if last_complete > 0:
+            repaired = body[:last_complete]
+            open_braces = repaired.count("{") - repaired.count("}")
+            if open_braces > 0:
+                repaired += "}" * open_braces
+            try:
+                json.loads(repaired)
+                return repaired
+            except json.JSONDecodeError:
+                pass
+        # Nothing complete: close the open string and the open braces.
+        in_string = False
+        escaped = False
+        for char in body:
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                in_string = not in_string
+        repaired = body
+        if in_string:
+            repaired += '"'
+        repaired = repaired.rstrip().rstrip(",")
+        repaired = re.sub(r",\s*$", "", repaired)
+        open_braces = repaired.count("{") - repaired.count("}")
+        if open_braces > 0:
+            repaired += "}" * open_braces
+        try:
+            json.loads(repaired)
+        except json.JSONDecodeError:
+            return None
+        return repaired
+
+    @staticmethod
+    def _scan_object_end(body: str) -> int | None:
+        """The index of the ``}`` that closes the object starting at ``body[0]``.
+
+        ``None`` is returned when the object is never closed (a truncated
+        response).
+        """
+        depth = 0
+        in_string = False
+        escaped = False
+        for index, char in enumerate(body):
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return index
+        return None
+
     def generate_json(self, request: LLMRequest) -> Any:
         """Generate and parse a JSON payload (retries once on parse failure)."""
         last_exc: Exception | None = None
-        for _ in range(2):
+        for attempt in range(2):
             resp = self.generate(request)
             text = resp.text.strip()
-            if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-            text = text.strip()
             try:
                 return json.loads(text)
             except json.JSONDecodeError as exc:  # pragma: no cover - defensive
                 last_exc = exc
-                logger.warning("LLM returned invalid JSON (%s), retrying once", exc)
+                repaired = self._extract_json(text)
+                if repaired is not None:
+                    logger.info(
+                        "LLM trả về JSON không chuẩn nhưng đã sửa được (%s)", exc
+                    )
+                    try:
+                        return json.loads(repaired)
+                    except json.JSONDecodeError:
+                        pass
+                if attempt == 0:
+                    logger.warning(
+                        "LLM returned invalid JSON (%s), retrying once", exc
+                    )
         raise LLMError(f"LLM did not return valid JSON: {last_exc}")
 
     def embed(self, texts: list[str]) -> list[list[float]]:  # pragma: no cover - interface
@@ -170,6 +325,8 @@ class GeminiClient(LLMClient):
         max_rate_limit_wait: float = 90.0,
         fallback_embed_models: list[str] | None = None,
         model_rpm: dict[str, int] | None = None,
+        model_tpm: dict[str, int] | None = None,
+        count_tokens: bool = True,
     ):
         try:
             from google import genai  # type: ignore
@@ -222,6 +379,14 @@ class GeminiClient(LLMClient):
         self._model_rpm = dict(model_rpm or {})
         self._call_times: dict[str, list[float]] = {}
         self._rpm_lock = threading.Lock()
+        # The *token* quota is the real limit of the Gemma family: the free
+        # tier allows 16 000 input tokens per minute, which a request-count
+        # limiter cannot express (one long prompt may use a large part of
+        # the budget).  See docs/10_quota_gemini_free_tier.md.
+        self._model_tpm = dict(model_tpm or {})
+        self._count_tokens_enabled = bool(count_tokens)
+        self._token_cache: dict[tuple[str, str], int] = {}
+        self._token_cache_lock = threading.Lock()
         # The quota is global per project+model, so the limiter is shared
         # between the worker processes through a lock file.
         self._rate_limit_dir = (
@@ -230,6 +395,7 @@ class GeminiClient(LLMClient):
             else Path(os.getenv("HGRAG_RATE_LIMIT_DIR", "artifacts/rate_limits"))
         )
         self._shared_limiters: dict[str, SharedRateLimiter] = {}
+        self._shared_token_limiters: dict[str, SharedTokenLimiter] = {}
 
     # -- helpers ---------------------------------------------------------
     def _cache_key(self, request: LLMRequest) -> str:
@@ -272,6 +438,66 @@ class GeminiClient(LLMClient):
             times = [t for t in self._call_times.get(model_name, []) if now - t < 60.0]
             times.append(now)
             self._call_times[model_name] = times
+
+    def _count_prompt_tokens(self, model_name: str, system: str, prompt: str) -> int:
+        """The number of input tokens of a request (exact, via ``count_tokens``).
+
+        ``count_tokens`` does *not* consume the generation quota (verified in
+        docs/10_quota_gemini_free_tier.md), so it can be used to book the
+        right amount of the token budget before the real call.
+
+        The Developer API does not accept a ``system_instruction`` in
+        ``count_tokens``, so the system prompt is counted **separately** and
+        added.  Ignoring it would under-count the real request by ~30 % and
+        the workers would then exceed the per-minute quota.
+
+        The results are cached per ``(model, text)``: the same context is sent
+        over and over during an evaluation run.
+        """
+        if not self._count_tokens_enabled:
+            # Rough fallback: Vietnamese text is roughly 2.5 characters per
+            # token for the Gemma tokenizer.
+            return max(1, (len(system) + len(prompt)) // 2)
+        prompt_tokens = self._count_text_tokens(model_name, prompt)
+        system_tokens = self._count_text_tokens(model_name, system) if system else 0
+        return max(1, prompt_tokens + system_tokens)
+
+    def _count_text_tokens(self, model_name: str, text: str) -> int:
+        """The token count of a piece of text (cached)."""
+        if not text.strip():
+            return 0
+        key = (model_name, text)
+        with self._token_cache_lock:
+            hit = self._token_cache.get(key)
+        if hit is not None:
+            return hit
+        tokens = 0
+        try:
+            resp = self._client.models.count_tokens(
+                model=model_name, contents=text
+            )
+            tokens = int(getattr(resp, "total_tokens", 0) or 0)
+        except Exception as exc:  # noqa: BLE001 - counting is best effort
+            logger.debug("count_tokens thất bại (%s) -- dùng ước lượng", exc)
+            tokens = 0
+        if tokens <= 0:
+            tokens = max(1, len(text) // 2)
+        with self._token_cache_lock:
+            self._token_cache[key] = tokens
+        return tokens
+
+    def _wait_for_tokens(self, model_name: str, tokens: int) -> None:
+        """Book ``tokens`` input tokens in the shared per-minute budget."""
+        tpm = self._model_tpm.get(model_name)
+        if not tpm or tpm <= 0:
+            return
+        shared = self._shared_token_limiters.get(model_name)
+        if shared is None:
+            shared = SharedTokenLimiter(
+                self._rate_limit_dir / f"{_slug(model_name)}.tokens.json", tpm
+            )
+            self._shared_token_limiters[model_name] = shared
+        shared.acquire(tokens)
 
     # -- API -------------------------------------------------------------
     @staticmethod
@@ -326,10 +552,10 @@ class GeminiClient(LLMClient):
             self._exhausted_models.clear()
             models_to_try = [request.model or self.model, *self.fallback_models]
         # A model that answered "429, retry after N s" is only *rate limited*
-        # for a few seconds.  The free tier applies the requests-per-minute
-        # quota *per model*, so rotating to another model is much faster than
-        # sleeping.  The throttled model is put on a short cooldown and is
-        # picked up again later.
+        # for a few seconds -- the per-minute budget.  It must NOT be rotated
+        # away: the fallback models of the free tier are capped by requests
+        # **per day**, so rotating would burn their daily budget for nothing.
+        # Instead the call waits and is retried on the *same* model.
         now = time.monotonic()
         cooled = [m for m in models_to_try if self._throttled.get(m, 0.0) <= now]
         if cooled:
@@ -340,9 +566,27 @@ class GeminiClient(LLMClient):
             if wait_for > 0:
                 logger.info("Mọi model đều bị giới hạn tốc độ -- chờ %.1fs", wait_for)
                 time.sleep(min(wait_for + 0.5, self.max_rate_limit_wait))
+                models_to_try = [
+                    m
+                    for m in models_to_try
+                    if self._throttled.get(m, 0.0) <= time.monotonic()
+                ] or models_to_try
+        # The token budget of the request is booked *before* the call, so that
+        # the parallel workers of an evaluation share one global budget
+        # instead of all hitting the per-minute limit at the same time.
+        # The tokens are booked once per request: a retry after a 429 re-uses
+        # the same reservation (the failed attempt did not consume the budget
+        # in a meaningful way, and double-booking would starve the run).
+        prompt_tokens = self._count_prompt_tokens(
+            models_to_try[0] if models_to_try else self.model, system, prompt
+        )
+        booked = False
         for model_name in models_to_try:
             for attempt in range(self.max_retries):
                 try:
+                    if not booked:
+                        self._wait_for_tokens(model_name, prompt_tokens)
+                        booked = True
                     self._wait_for_rpm(model_name)
                     kwargs: dict[str, Any] = {"model": model_name, "contents": prompt}
                     if system:
@@ -375,25 +619,38 @@ class GeminiClient(LLMClient):
                     )
                     code = int(status) if isinstance(status, int) else None
                     if code == 429:
-                        # Free tier: quota theo *phút* (hoặc theo ngày).  Nếu API
-                        # gợi ý thời gian chờ thì tôn trọng nó; nếu hết hẳn quota
-                        # ngày thì chuyển sang model dự phòng.
+                        # Free tier: quota theo *phút* (token/phút) hoặc theo
+                        # *ngày*.  Nếu API gợi ý thời gian chờ ngắn thì đó là
+                        # quota theo phút: chờ rồi thử lại **cùng model**.
+                        # Xoay sang model dự phòng sẽ đốt quota *ngày* của
+                        # Gemini -- điều mà không thể hoàn lại trong một lượt
+                        # chạy.  Xem docs/10_quota_gemini_free_tier.md.
                         wait = _retry_after_seconds(exc)
                         if wait is not None and wait <= self.max_rate_limit_wait:
-                            # Chỉ bị giới hạn tốc độ: đưa model này vào cooldown
-                            # và thử model kế tiếp ngay (mỗi model có quota
-                            # RPM riêng).
                             self._throttled[model_name] = time.monotonic() + wait
+                            if attempt + 1 < self.max_retries:
+                                logger.warning(
+                                    "Gemini giới hạn tốc độ (model=%s, %.0fs) -- "
+                                    "chờ rồi thử lại",
+                                    model_name,
+                                    wait,
+                                )
+                                time.sleep(wait + 0.5)
+                                continue
+                            # Hết số lần thử của model này: thử model kế tiếp.
                             logger.warning(
-                                "Gemini giới hạn tốc độ (model=%s, %.0fs) -- chuyển model khác",
+                                "Gemini giới hạn tốc độ (model=%s) sau %d lần thử "
+                                "-- chuyển model khác",
                                 model_name,
-                                wait,
+                                self.max_retries,
                             )
                             break
+                        # Quota *ngày* đã cạn: model này không dùng được cho
+                        # tới ngày mai.
+                        self._exhausted_models.add(model_name)
                         logger.warning(
                             "Gemini quota hết cho model %s -> chuyển model khác", model_name
                         )
-                        self._exhausted_models.add(model_name)
                         break
                     if code is not None and code not in RETRYABLE_STATUS:
                         raise LLMError(
@@ -740,6 +997,8 @@ def build_llm_client(settings: Any | None = None) -> LLMClient:
                 fallback_models=llm_cfg.get("fallback_models", []),
                 fallback_embed_models=llm_cfg.get("fallback_embed_models", []),
                 model_rpm=llm_cfg.get("model_rpm", {}),
+                model_tpm=llm_cfg.get("model_tpm", {}),
+                count_tokens=llm_cfg.get("count_tokens", True),
             )
         except LLMError as exc:
             logger.warning("Không khởi tạo được GeminiClient (%s) -> dùng mock", exc)

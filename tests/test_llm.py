@@ -17,6 +17,7 @@ import pytest
 from hgrag.llm.client import (
     DiskCache,
     GeminiClient,
+    LLMClient,
     LLMError,
     MockLLMClient,
     build_llm_client,
@@ -128,6 +129,62 @@ class TestGenerateJsonErrors:
 
         payload = _Fenced(embed_dim=8).generate_json(_req("judge"))
         assert payload == {"score": 1}
+
+    def test_recovers_json_wrapped_in_prose(self):
+        class _Prose(MockLLMClient):
+            def generate(self, request: LLMRequest):  # type: ignore[override]
+                from hgrag.llm.schemas import LLMResponse
+
+                return LLMResponse(
+                    text='Kết quả: {"score": 1, "correct": true}', model="prose"
+                )
+
+        payload = _Prose(embed_dim=8).generate_json(_req("judge"))
+        assert payload == {"score": 1, "correct": True}
+
+    def test_recovers_a_truncated_json(self):
+        """Gemma đôi khi cắt ngang JSON -> phải sửa lại được."""
+
+        class _Truncated(MockLLMClient):
+            def generate(self, request: LLMRequest):  # type: ignore[override]
+                from hgrag.llm.schemas import LLMResponse
+
+                return LLMResponse(
+                    text='{"score": 2, "correct": true, "reason": "Đáp án đúng và đầy',
+                    model="truncated",
+                )
+
+        payload = _Truncated(embed_dim=8).generate_json(_req("judge"))
+        assert payload["score"] == 2
+        assert payload["correct"] is True
+
+
+class TestExtractJson:
+    """The JSON repair helper of the LLM layer."""
+
+    def test_pure_json_is_returned_unchanged(self):
+        assert LLMClient._extract_json('{"a": 1}') == '{"a": 1}'
+
+    def test_markdown_fence_is_stripped(self):
+        assert LLMClient._extract_json('```json\n{"a": 1}\n```') == '{"a": 1}'
+
+    def test_prose_around_the_object_is_stripped(self):
+        assert LLMClient._extract_json('Kết quả: {"a": 1}') == '{"a": 1}'
+
+    def test_truncated_object_is_closed(self):
+        repaired = LLMClient._extract_json('{"score": 2, "reason": "cắt ngang')
+        assert repaired is not None
+        assert json.loads(repaired)["score"] == 2
+
+    def test_no_json_at_all_returns_none(self):
+        assert LLMClient._extract_json("không có json ở đây") is None
+
+    def test_empty_text_returns_none(self):
+        assert LLMClient._extract_json("") is None
+
+    def test_nested_objects_are_handled(self):
+        payload = {"a": {"b": [1, 2]}, "c": "x"}
+        assert json.loads(LLMClient._extract_json(json.dumps(payload))) == payload
 
 
 # --------------------------------------------------------------------------
@@ -531,3 +588,127 @@ class TestGeminiClientMocked:
         resp = mock_llm.generate(_req("judge"))
         payload = json.loads(resp.text)
         assert isinstance(payload, dict)
+
+    def test_count_tokens_used_when_available(self, monkeypatch, tmp_path: Path):
+        """Số token được đếm chính xác bằng ``count_tokens``."""
+        calls = {"n": 0}
+
+        class _Models(_FakeModels):
+            def count_tokens(self, **kwargs: Any):
+                calls["n"] += 1
+                return SimpleNamespace(total_tokens=4321)
+
+        models = _Models(lambda kwargs: _ok_response("ok"))
+        genai_module = SimpleNamespace(Client=lambda **kwargs: _FakeClient(models))
+        google_module = SimpleNamespace(genai=genai_module)
+        import sys
+
+        monkeypatch.setitem(sys.modules, "google", google_module)
+        monkeypatch.setitem(sys.modules, "google.genai", genai_module)
+
+        client = GeminiClient(model="gemini-test", api_key="k", cache_dir=tmp_path / "cache")
+        tokens = client._count_prompt_tokens("gemini-test", "", "câu hỏi")
+        assert tokens == 4321
+        assert calls["n"] == 1
+
+    def test_count_tokens_falls_back_to_estimate(self, monkeypatch, tmp_path: Path):
+        """Khi ``count_tokens`` lỗi, client ước lượng theo độ dài prompt."""
+        models = _install_fake_genai(monkeypatch, lambda kwargs: _ok_response("ok"))
+
+        def _boom(**kwargs: Any):
+            raise RuntimeError("không hỗ trợ")
+
+        models.count_tokens = _boom  # type: ignore[attr-defined]
+        client = GeminiClient(model="gemini-test", api_key="k", cache_dir=tmp_path / "cache")
+        tokens = client._count_prompt_tokens("gemini-test", "", "x" * 400)
+        assert tokens == 200
+
+    def test_token_limiter_books_the_prompt_size(self, monkeypatch, tmp_path: Path):
+        """Token của prompt được đặt trước trong hạn mức dùng chung."""
+        models = _install_fake_genai(monkeypatch, lambda kwargs: _ok_response("ok"))
+        models.count_tokens = lambda **kw: SimpleNamespace(total_tokens=1000)  # type: ignore[attr-defined]
+        client = GeminiClient(
+            model="gemini-test",
+            api_key="k",
+            cache_dir=tmp_path / "cache",
+            model_tpm={"gemini-test": 5000},
+        )
+        client.generate(_req("judge"))
+        limiter_file = tmp_path / "rate_limits" / "gemini-test.tokens.json"
+        assert limiter_file.exists()
+        import json as _json
+
+        pairs = _json.loads(limiter_file.read_text(encoding="utf-8"))
+        assert sum(p[1] for p in pairs) == 1000
+
+
+class TestGeminiClientRateLimitHandling:
+    """Xử lý 429: quota theo *phút* phải chờ rồi thử lại cùng model."""
+
+    def _install_throttled(self, monkeypatch, fail_times: int, models_used: list[str]):
+        state = {"n": 0}
+
+        def _behaviour(kwargs: Any):
+            state["n"] += 1
+            models_used.append(kwargs["model"])
+            if state["n"] <= fail_times:
+                err = RuntimeError("429 RESOURCE_EXHAUSTED")
+                err.code = 429
+                err.response = SimpleNamespace(
+                    json=lambda: {"details": [{"retryInfo": [{"retryDelay": "3s"}]}]}
+                )
+                raise err
+            return _ok_response("ok")
+
+        _install_fake_genai(monkeypatch, _behaviour)
+        monkeypatch.setattr("hgrag.llm.client.time.sleep", lambda s: None)
+
+    def test_per_minute_quota_retries_same_model(self, monkeypatch, tmp_path: Path):
+        """429 kèm RetryInfo ngắn -> chờ rồi thử lại CHÍNH model đó.
+
+        Xoay sang model dự phòng sẽ đốt quota *ngày* của Gemini, không thể
+        hoàn lại trong một lượt chạy (xem docs/10_quota_gemini_free_tier.md).
+        """
+        used: list[str] = []
+        self._install_throttled(monkeypatch, fail_times=1, models_used=used)
+        client = GeminiClient(
+            model="model-chính",
+            api_key="k",
+            cache_dir=tmp_path / "cache",
+            fallback_models=["model-dự-phòng"],
+            max_retries=3,
+        )
+        resp = client.generate(_req("judge"))
+        assert resp.text == "ok"
+        assert used == ["model-chính", "model-chính"]
+
+    def test_daily_quota_rotates_to_fallback_model(self, monkeypatch, tmp_path: Path):
+        """429 không kèm RetryInfo ngắn -> quota ngày cạn -> xoay model."""
+        used: list[str] = []
+
+        def _behaviour(kwargs: Any):
+            used.append(kwargs["model"])
+            if kwargs["model"] == "model-chính":
+                err = RuntimeError("429 RESOURCE_EXHAUSTED")
+                err.code = 429
+                raise err
+            return _ok_response("ok")
+
+        _install_fake_genai(monkeypatch, _behaviour)
+        monkeypatch.setattr("hgrag.llm.client.time.sleep", lambda s: None)
+        client = GeminiClient(
+            model="model-chính",
+            api_key="k",
+            cache_dir=tmp_path / "cache",
+            fallback_models=["model-dự-phòng"],
+        )
+        resp = client.generate(_req("judge"))
+        assert resp.text == "ok"
+        assert used == ["model-chính", "model-dự-phòng"]
+
+    def test_cache_key_includes_the_model(self, tmp_path: Path):
+        """Cache phải phân vùng theo model, nếu không kết quả của hai model
+        khác nhau sẽ bị trộn lẫn trong cùng một bảng so sánh."""
+        a = GeminiClient(model="model-a", api_key="k", cache_dir=tmp_path / "cache")
+        b = GeminiClient(model="model-b", api_key="k", cache_dir=tmp_path / "cache")
+        assert a._cache_key(_req("judge")) != b._cache_key(_req("judge"))

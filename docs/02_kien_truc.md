@@ -21,6 +21,7 @@ flowchart TB
   end
   subgraph llm["hgrag.llm"]
     CL[client.py<br/>Gemini + OpenAI-compat + mock]
+    RL[rate_limit.py<br/>giới hạn RPM dùng chung<br/>giữa các tiến trình]
     PR[prompts.py]
     SC[schemas.py]
   end
@@ -55,6 +56,7 @@ flowchart TB
   end
   CL --> PR
   CL --> SC
+  CL --> RL
   V --> CH
   W --> CH
   CH --> NM
@@ -173,7 +175,7 @@ vietnam_history_graphrag/
 ├── docs/                          # (tài liệu này)
 ├── src/hgrag/
 │   ├── config.py
-│   ├── llm/       client.py prompts.py schemas.py
+│   ├── llm/       client.py rate_limit.py prompts.py schemas.py
 │   ├── data/      vhe.py wikipedia.py history_chat.py chunking.py normalize.py
 │   ├── kg/        ontology.py labels.py builder.py alias.py store.py vhe_gold.py
 │   ├── retrieval/ embeddings.py vector_store.py entity_linker.py
@@ -184,7 +186,7 @@ vietnam_history_graphrag/
 ├── scripts/       00_up.sh 00_down.sh 01_ingest.py 03_build_kg.py 04_embed.py
 │                  05_eval_dataset.py 06_ask.py 07_run_eval.py 08_smoke_test.sh
 │                  09_live_check.py 10_validate_eval_paths.py 11_fix_eval_paths.py
-│                  run_all.sh
+│                  12_merge_eval.py run_all.sh
 ├── notebooks/kaggle/ 01_embed_corpus.ipynb 02_finetune_embedder.ipynb
 ├── data/raw  data/processed  artifacts/  reports/
 └── tests/
@@ -200,6 +202,32 @@ vietnam_history_graphrag/
 | `VectorStore` | `QdrantVectorStore` | `NumpyVectorStore` (brute-force cosine) |
 
 Tất cả đọc cấu hình từ `configs/default.yaml` + biến môi trường.
+
+### 6.1 Lớp LLM và hạn mức free tier
+
+`hgrag.llm.client.GeminiClient` là điểm duy nhất mà code gọi được API.  Nó
+đảm bảo bốn điều khi hạn mức của Google AI Studio bị siết:
+
+| Đặc điểm của free tier | Cơ chế trong client |
+|---|---|
+| Quota **ngày** (20 req/ngày cho Flash, 500 cho Flash-Lite) | `_exhausted_models` ghi nhớ model đã cạn → không phải trả giá một lời gọi thất bại cho mỗi request; khi **mọi** model cạn, danh sách được reset để nhận lại quota theo ngày |
+| Quota **phút** (15–30 req/phút) | `_throttled` đưa model vào cooldown ngắn rồi **xoay sang model khác**; `_wait_for_rpm` giãn nhịp chủ động theo `llm.model_rpm` |
+| Hạn mức tính **chung cho mọi tiến trình** | `hgrag.llm.rate_limit.SharedRateLimiter` — các worker `flock` trên cùng một file nên tổng số request/phút vẫn trong hạn mức |
+| Quota **embedding** tách riêng với quota chat | `_embed_quota_exhausted` (circuit breaker) + `fallback_embed_models`; vì không gian vector phải nhất quán, corpus được **embed lại** bằng model mới |
+
+Ngoài ra, khoá cache của client chứa **tên model chính** → đổi model giữa hai
+lượt chạy không thể vô tình dùng lại câu trả lời của model cũ.
+
+### 6.2 Cache tồn tại lâu
+
+Ba tầng cache trên đĩa giúp chạy lại gần như miễn phí:
+
+| Cache | Vị trí | Nội dung |
+|---|---|---|
+| LLM | `artifacts/llm_cache/` | theo hash của request (+ tên model) |
+| Embedding | `artifacts/llm_cache/` | theo hash của `model + text + dim` |
+| Vector của entity | `artifacts/alias_embeddings.json` | vector của ~14 000 entity để tầng liên kết tầng 5 không phải embed lại (4 phút CPU) mỗi lần khởi động |
+| Chỉ mục từ khoá | `artifacts/lexical_index.json` | dự phòng khi quota embedding cạn |
 
 ## 7. Luồng chạy chính (`scripts/run_all.sh`)
 
@@ -219,6 +247,7 @@ Tất cả đọc cấu hình từ `configs/default.yaml` + biến môi trườn
 07_run_eval.py                # chạy B0/B1/B2/Ours + A1–A7 → reports/results.{csv,md} + figures/
 08_smoke_test.sh              # kiểm tra offline toàn hệ thống (imports, pytest, services)
 09_live_check.py              # kiểm tra dịch vụ thật (Gemini + Neo4j + Qdrant + QA end-to-end)
+12_merge_eval.py              # gộp checkpoint của nhiều worker → một báo cáo
 run_all.sh                    # chạy toàn bộ pipeline theo đúng thứ tự trên
 ```
 
@@ -245,7 +274,7 @@ Mỗi bước **idempotent**, có cache, chạy lại được, seed cố địn
 | Vector store | Qdrant `chunks_local` (438 chunk, 384 chiều, MiniLM đa ngôn ngữ) + `chunks_vhe_local` (4 110 câu VHE, 384 chiều) |
 | Bộ câu hỏi | **150 câu**: 88 VHE template · 30 LLM-from-Wikipedia · 10 history chat · 22 out-of-KB |
 | Gold path | **97,7%** node của gold path có thật trong đồ thị (`scripts/10_validate_eval_paths.py`) |
-| Test | `pytest` 100% pass (offline, không gọi mạng) |
+| Test | `pytest` 100% pass (offline, không gọi mạng) — **313 test + 2 skip** |
 | Báo cáo | `reports/results.md`, `reports/results.csv`, `reports/figures/*.png` |
 
 ### 9.1 Hai đồ thị con (subgraph)

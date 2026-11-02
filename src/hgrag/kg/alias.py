@@ -404,11 +404,27 @@ class AliasResolver:
     # index
     # ------------------------------------------------------------------
     def enable_embed_cache(self, path: str | Path | None) -> None:
-        """Persist the entity vectors on disk (see ``_embed_cache_path``)."""
+        """Persist the entity vectors on disk (see ``_embed_cache_path``).
+
+        The cache is only reused when it was written by the **same embedder**:
+        the vectors of a 384-dim local model and of a 768-dim Gemini model
+        live in different spaces, and mixing them would silently corrupt the
+        cosine similarity of tier 5 (embedding-based entity linking).
+        """
         self._embed_cache_path = Path(path) if path else None
         if self._embed_cache_path and self._embed_cache_path.exists():
             try:
                 payload = json.loads(self._embed_cache_path.read_text(encoding="utf-8"))
+                cached_embedder = str(payload.get("embedder", "") or "")
+                current = str(getattr(self.embedder, "name", "") or "")
+                if cached_embedder and current and cached_embedder != current:
+                    logger.warning(
+                        "Alias embed cache được tạo bởi %r nhưng embedder hiện tại là %r "
+                        "-- bỏ qua cache",
+                        cached_embedder,
+                        current,
+                    )
+                    return
                 vectors = payload.get("vectors") or {}
                 self._embed_cache = {
                     str(k): [float(x) for x in v] for k, v in vectors.items()

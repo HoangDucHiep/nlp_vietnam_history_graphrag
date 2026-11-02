@@ -25,12 +25,21 @@ llm:
   # Giới hạn req/phút của từng model, để client tự giãn nhịp gọi thay vì
   # ăn 429 rồi xoay vòng (mỗi lần 429 đều đốt quota của model dự phòng).
   model_rpm:
-    gemma-4-26b-a4b-it: 28
-    gemma-4-31b-it: 28
+    gemma-4-26b-a4b-it: 26
+    gemma-4-31b-it: 26
     gemini-flash-lite-latest: 14
     gemini-3.5-flash: 14
     gemini-3.8-flash: 14
     gemini-3.1-flash-lite: 14
+  # Quota thật của Gemma là **token đầu vào / phút**
+  # (GenerateContentInputTokensPerModelPerMinute = 16 000), không phải số
+  # request.  Bộ giới hạn token dùng chung giữa các worker (flock) nên mọi
+  # tiến trình cùng chia sẻ một hạn mức toàn cục.
+  # Xem docs/10_quota_gemini_free_tier.md.
+  model_tpm:
+    gemma-4-26b-a4b-it: 14500
+  # Bật/tắt việc đếm token chính xác bằng `count_tokens` (không tốn quota).
+  count_tokens: true
   embed_model: gemini-embedding-2
   # Quota của model embedding là độc lập với quota chat.  Khi model chính
   # cạn, client chuyển sang model dự phòng -- khi đó corpus phải được

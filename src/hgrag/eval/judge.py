@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -62,6 +63,9 @@ Quy tắc grounded:
 
 Quy tắc supported_evidence_ids:
 - Liệt kê các mã evidence (ví dụ "E1") thực sự chứng minh mệnh đề trong đáp án.
+
+Quy tắc về độ dài:
+- Trường "reason" chỉ ghi TỐI ĐA 2 câu ngắn (khoảng 40 từ). Không lặp lại câu hỏi, không trích lại CONTEXT.
 
 Trả về DUY NHẤT một JSON object hợp lệ, không markdown fence.
 """
@@ -196,9 +200,16 @@ class JudgeResult:
 class LLMJudge:
     """Judge backed by an :class:`~hgrag.llm.client.LLMClient`."""
 
-    def __init__(self, llm_client: Any = None) -> None:
+    def __init__(
+        self,
+        llm_client: Any = None,
+        max_retries: int = 3,
+        retry_base_delay: float = 2.0,
+    ) -> None:
         self.llm_client = llm_client
         self.calls = 0
+        self.max_retries = max(1, int(max_retries))
+        self.retry_base_delay = float(retry_base_delay)
 
     def grade(
         self,
@@ -244,12 +255,35 @@ class LLMJudge:
             fallback.degraded = True
             return fallback
         result = _result_from_payload(payload)
+        if result is None:
+            # The JSON was repaired but the rubric fields are missing: the
+            # verdict would be meaningless, so the row is marked as degraded.
+            fallback = HeuristicJudge().grade(
+                question=question,
+                answer=answer,
+                reference=reference,
+                gold_facts=gold_facts,
+                evidence=evidence,
+                out_of_kb=out_of_kb,
+                closed_book=closed_book,
+            )
+            fallback.degraded = True
+            return fallback
         if closed_book:
             result.grounded = True
         return result
 
     # ------------------------------------------------------------------
     def _ask(self, prompt: str) -> dict[str, Any] | None:
+        """Ask the judge, retrying on transient failures.
+
+        A single failed call must not silently degrade the verdict to the
+        token-F1 heuristic: mixing the two kinds of score in one table makes
+        the comparison between the systems meaningless.  The client already
+        handles the per-minute quota internally (it waits and retries on the
+        *same* model), so a failure here is a real one -- but a couple of
+        retries still absorb the transient 500s of the free tier.
+        """
         if self.llm_client is None:
             return None
         from ..llm.schemas import LLMMessage, LLMRequest
@@ -263,13 +297,37 @@ class LLMJudge:
             task="judge_answer",
             temperature=0.0,
             response_schema=JUDGE_SCHEMA,
+            # The verdict only needs a handful of fields.  A small budget keeps
+            # the model from degenerating into a repetition loop: Gemma
+            # sometimes repeats a phrase until the token budget of the
+            # request is exhausted, and the response is then truncated in the
+            # middle of the JSON.
+            max_output_tokens=256,
         )
-        try:
-            payload = self.llm_client.generate_json(request)
-        except Exception as exc:  # noqa: BLE001 - the judge must never crash the run
-            logger.info("Judge thất bại (%s) -> dùng heuristic", exc)
-            return None
-        return payload if isinstance(payload, dict) else None
+        last_exc: Exception | None = None
+        for attempt in range(self.max_retries):
+            try:
+                payload = self.llm_client.generate_json(request)
+            except Exception as exc:  # noqa: BLE001 - the judge must never crash the run
+                last_exc = exc
+                if attempt + 1 < self.max_retries:
+                    delay = self.retry_base_delay * (2**attempt)
+                    logger.info(
+                        "Judge thất bại (lần %d/%d): %s -- thử lại sau %.1fs",
+                        attempt + 1,
+                        self.max_retries,
+                        str(exc)[:120],
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.warning("Judge thất bại (%s) -> dùng heuristic", exc)
+                return None
+            if isinstance(payload, dict):
+                return payload
+            logger.info("Judge trả về payload không phải dict -> thử lại")
+        _ = last_exc
+        return None
 
 
 class HeuristicJudge:
@@ -373,11 +431,20 @@ def _render_evidence(evidence: Sequence[Any] | None) -> str:
     return "\n\n".join(lines)
 
 
-def _result_from_payload(payload: dict[str, Any]) -> JudgeResult:
+def _result_from_payload(payload: dict[str, Any]) -> JudgeResult | None:
+    """Build a verdict from the judge's payload.
+
+    ``None`` is returned when the payload does not carry the fields of the
+    rubric: a partially repaired JSON must not silently become a score of 0.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if "score" not in payload:
+        return None
     try:
         score = float(payload.get("score", 0) or 0)
     except (TypeError, ValueError):
-        score = 0.0
+        return None
     score = max(0.0, min(2.0, score))
     supported = [str(s).strip().upper() for s in (payload.get("supported_evidence_ids") or [])]
     return JudgeResult(

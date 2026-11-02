@@ -221,3 +221,27 @@ Kết quả phân tích lỗi là phần **quan trọng nhất** của báo cáo
 | LLM-judge thiên lệch về câu trả lời dài/dài dòng | Rubric cố định + kèm gold facts + kiểm tra chéo bằng token-F1 |
 | Đáp án tham chiếu từ History Chat bị sai | Bắt buộc human verify trước khi đưa vào bộ đánh giá |
 | Chênh lệch giữa judge và người đánh giá | Lấy mẫu 30 câu để đo độ đồng thuận, báo cáo trong bài |
+
+## 7. Vận hành khi API free tier bị giới hạn
+
+Lần chạy đánh giá đầy đủ (150 câu × 11 hệ thống = 1 650 lượt chấm, mỗi lượt
+cần 1 lời gọi sinh đáp án + 1 lời gọi chấm ≈ 3 300 lời gọi) đã vấp phải giới
+hạn của Google AI Studio.  Bốn điểm đã được xử lý trong mã nguồn:
+
+| Vấn đề | Nguyên nhân | Cách xử lý |
+|---|---|---|
+| **Quota ngày của Gemini cạn** | Các model Gemini (flash / flash-lite) có quota **20 (flash) / 500 (lite) request mỗi ngày**; vài worker chạy song song là cạn hết trong vài phút. Lỗi 429 kèm `RetryInfo.retryDelay ≈ 3 h 30 m` | Model chính chuyển sang **Gemma** (`gemma-4-26b-a4b-it`) — bucket quota riêng, 30 request **mỗi phút**. Các model Gemini giữ làm dự phòng |
+| **429 làm chậm toàn bộ lượt chạy** | Client cũ *ngủ* đúng số giây API yêu cầu rồi thử lại **cùng** model | Client giờ **xoay vòng sang model khác** (mỗi model có hạn mức RPM riêng) và **giãn nhịp chủ động** theo hạn mức `model_rpm` |
+| **Nhiều worker vượt hạn mức chung** | Hạn mức RPM tính **theo project + model**, tức là *dùng chung* cho mọi tiến trình | `hgrag.llm.rate_limit.SharedRateLimiter` — mỗi worker gọi `flock` trên cùng một file nên tổng số request/phút vẫn nằm trong hạn mức |
+| **Judge rơi về heuristic mà không báo** | Khi LLM judge không gọi được, `HeuristicJudge` (token-F1) được dùng thay và **không ai biết** — 722/1 075 dòng bị chấm sai kiểu | `JudgeResult.degraded` / `EvalRow.judge_degraded` được gắn cờ, đếm trong `EvalRun.meta.n_degraded` và **cảnh báo ngay trong `reports/results.md`** |
+
+> **Quy tắc bất di bất dịch của thiết kế đánh giá**: cùng LLM, cùng prompt,
+> cùng corpus cho mọi hệ thống.  Vì vậy khoá cache của LLM client chứa cả
+> **tên model chính** (`_cache_key`), nên đổi model giữa hai lượt chạy không
+> thể vô tình dùng lại câu trả lời của model cũ.
+>
+> **Nếu một lượt chấm rơi về heuristic thì phải chạy lại** — trộn điểm
+> token-F1 với điểm LLM trong cùng một bảng làm mất ý nghĩa của so sánh.
+> `scripts/12_merge_eval.py` đếm số dòng thiếu và số dòng bị degrade trước
+> khi sinh báo cáo.
+

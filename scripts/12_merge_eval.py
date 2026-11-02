@@ -47,6 +47,7 @@ def load_rows(paths: list[str]) -> EvalRun:
     """Load every checkpoint and merge the rows (first writer wins)."""
     run = EvalRun(meta={"n_questions": 0, "systems": []})
     seen: set[tuple[str, str]] = set()
+    degraded = 0
     for raw_path in paths:
         path = Path(raw_path)
         if not path.is_absolute():
@@ -58,8 +59,9 @@ def load_rows(paths: list[str]) -> EvalRun:
         meta = payload.get("meta") or {}
         run.meta.setdefault("config", meta.get("config") or {})
         for key, value in meta.items():
-            if key not in ("n_questions", "systems") and key not in run.meta:
+            if key not in ("n_questions", "systems", "n_degraded") and key not in run.meta:
                 run.meta[key] = value
+        degraded += int(meta.get("n_degraded", 0) or 0)
         for raw in payload.get("rows") or []:
             row = EvalRow(**{k: v for k, v in raw.items() if k in EvalRow.__annotations__})
             key = (row.system, row.qid)
@@ -70,7 +72,28 @@ def load_rows(paths: list[str]) -> EvalRun:
         logger.info("%s: %d dòng", path.name, len(payload.get("rows") or []))
     run.meta["n_questions"] = len({r.qid for r in run.rows})
     run.meta["systems"] = sorted({r.system for r in run.rows})
+    # The degraded rows are counted on the *rows* (not on the meta of the
+    # checkpoints): a checkpoint may have been written before the flag was
+    # introduced, and the rows are the authoritative source.
+    n_degraded = sum(1 for r in run.rows if getattr(r, "judge_degraded", False))
+    run.meta["n_degraded"] = n_degraded
+    run.meta["judge_source"] = "llm" if n_degraded == 0 else "mixed"
+    if degraded and not n_degraded:
+        run.meta["n_degraded"] = degraded
     return run
+
+
+def check_completeness(run: EvalRun) -> list[str]:
+    """Return the list of the (system, qid) pairs that are still missing."""
+    systems = run.meta.get("systems") or []
+    qids = sorted({r.qid for r in run.rows})
+    have = {(r.system, r.qid) for r in run.rows}
+    return [
+        f"{system}/{qid}"
+        for system in systems
+        for qid in qids
+        if (system, qid) not in have
+    ]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -81,6 +104,14 @@ def main(argv: list[str] | None = None) -> int:
     if not run.rows:
         print(json.dumps({"error": "Không có dòng kết quả nào"}, ensure_ascii=False))
         return 4
+
+    missing = check_completeness(run)
+    if missing:
+        logger.warning(
+            "Thiếu %d cặp (hệ thống, câu hỏi) -- ví dụ: %s",
+            len(missing),
+            ", ".join(missing[:8]),
+        )
 
     comparisons = [
         compare_systems(run, baseline=baseline, target="ours", n_samples=args.bootstrap, seed=args.seed)
@@ -102,6 +133,9 @@ def main(argv: list[str] | None = None) -> int:
         "n_questions": run.meta.get("n_questions"),
         "n_rows": len(run.rows),
         "systems": run.meta.get("systems"),
+        "n_degraded": run.meta.get("n_degraded"),
+        "n_missing": len(missing),
+        "missing_sample": missing[:20],
         "artifacts": artefacts,
         "raw_rows": str(out_path),
         "comparisons": comparisons,

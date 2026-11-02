@@ -61,12 +61,19 @@ Tầng chuẩn hoá (tên gọi trong `kg/alias.py`), từ rẻ → đắt, dừ
 | **T4** | khớp `name_key` đã chuẩn hoá (bỏ dấu, bỏ honorific) | `0.85` |
 | **T5** | embedding + LLM disambiguation (top-k ứng viên) | `0.60–0.90` |
 
-- `kg/alias.py` chịu trách nhiệm **5 tầng QID-first** (ADR-07) và sinh *nhiều* ứng viên.
+- `kg/alias.py` chịu trách nhiệm **6 tầng QID-first** (ADR-07) và sinh *nhiều* ứng viên.
 - `retrieval/entity_linker.py` là lớp vỏ của tầng QA: mỗi mention chỉ giữ **một anchor tốt nhất**, có ngưỡng cứng `entity_link_min_confidence = 0.7`; không khớp được thì trả danh sách **rỗng** (không bịa entity).
 - Cờ ablation: `use_resolution=False` chỉ giữ **T0** → dùng cho ablation A1 (bỏ entity linking) và A2 (bỏ entity resolution).
 - `entity_linker` còn trích xuất mention tiếng Việt bằng regex + danh sách stopword (`VIETNAMESE_STOPWORDS`) để pipeline vẫn chạy được khi bước Query Understanding không có kết quả.
 
 > **Lưu ý thực tế**: bảng alias của hệ thống chạy chủ yếu ở **T0/T4** (node đã có trong KG + khớp tên đã chuẩn hoá); các tầng T1–T3 cần mạng và bị bỏ qua khi offline. Vì vậy ablation A1 cho thấy tác động của *tầng khớp mờ*, còn A2 cho thấy tác động của việc gộp node trùng.
+>
+> **Chi phí của tầng T5**: tầng này cần vector của *mọi* entity trong bảng alias
+> (~14 000 entity).  Trên CPU, việc embed 441 batch mất ~4 phút — và phải
+> lặp lại ở mỗi lần khởi động của harness đánh giá.  Vì vậy vector được
+> cache trên đĩa tại `artifacts/alias_embeddings.json`
+> (`AliasResolver.enable_embed_cache` / `save_embed_cache`): lần đầu tiên
+> embed rồi ghi đĩa, các lần sau nạp lại trong ~1 giây.
 
 ## 4. Truy xuất vector
 
@@ -177,7 +184,7 @@ flowchart LR
 | Liên quan nhưng KG không đủ thông tin | Trả "Tài liệu hiện có không đủ thông tin" |
 | Có đáp án nhưng thiếu căn cứ truy vết | Đánh dấu `grounded=False`, vẫn hiển thị để phân tích lỗi |
 
-Bộ đánh giá có **20 câu out-of-KB** để đo hành vi này — đây là điểm mà baseline RAG thuần hay "bịa" và GraphRAG có lợi thế.
+Bộ đánh giá có **22 câu out-of-KB** để đo hành vi này — đây là điểm mà baseline RAG thuần hay "bịa" và GraphRAG có lợi thế.
 
 ## 10. Ví dụ minh hoạ
 
