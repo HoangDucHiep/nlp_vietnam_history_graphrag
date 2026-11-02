@@ -193,6 +193,13 @@ class GeminiClient(LLMClient):
         ]
         self._client = genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
         self._embed_dim = output_dim or 768
+        # Circuit breaker: set once every embedding model refused with a
+        # "quota exhausted" error (see :meth:`_embed_batch`).
+        self._embed_quota_exhausted = False
+        # Chat models whose daily quota is exhausted.  They are skipped
+        # until every model is exhausted (then the list is reset, so a
+        # quota reset is picked up automatically).
+        self._exhausted_models: set[str] = set()
 
     # -- helpers ---------------------------------------------------------
     def _cache_key(self, request: LLMRequest) -> str:
@@ -247,6 +254,14 @@ class GeminiClient(LLMClient):
 
         last_error: Exception | None = None
         models_to_try = [request.model or self.model, *self.fallback_models]
+        # The models whose quota is exhausted are remembered: a full
+        # evaluation makes ~3 000 calls and each of them would otherwise
+        # pay the ~5 s of the failed request before rotating to the next
+        # model.
+        models_to_try = [m for m in models_to_try if m not in self._exhausted_models]
+        if not models_to_try:
+            self._exhausted_models.clear()
+            models_to_try = [request.model or self.model, *self.fallback_models]
         for model_name in models_to_try:
             for attempt in range(self.max_retries):
                 try:
@@ -296,6 +311,7 @@ class GeminiClient(LLMClient):
                         logger.warning(
                             "Gemini quota hết cho model %s -> chuyển model khác", model_name
                         )
+                        self._exhausted_models.add(model_name)
                         break
                     if code is not None and code not in RETRYABLE_STATUS:
                         raise LLMError(
@@ -385,9 +401,21 @@ class GeminiClient(LLMClient):
         Some embedding models (``gemini-embedding-2``) only accept a *single*
         input per request, so the batch is split into one call per text
         whenever the API returns fewer vectors than requested.
+
+        **Circuit breaker.**  Once every embedding model has refused with a
+        "quota exhausted" error, the client remembers it and fails *fast*
+        on the next calls.  The alternative is catastrophic: the KG build
+        resolves thousands of mentions, and every single one of them would
+        wait for the full retry ladder of every embedding model.
         """
+        if self._embed_quota_exhausted:
+            raise LLMError(
+                "Quota embedding của Gemini đã cạn (đã ghi nhớ) -> "
+                "dùng model embedding cục bộ"
+            )
         last_error: Exception | None = None
         models_to_try = [self.embed_model, *self.fallback_embed_models]
+        quota_hit = False
         for model_name in models_to_try:
             for attempt in range(self.embed_max_retries):
                 try:
@@ -416,6 +444,7 @@ class GeminiClient(LLMClient):
                             model_name,
                             suggested,
                         )
+                        quota_hit = True
                         break
                     delay = suggested or (self.retry_base_delay * (2**attempt))
                     logger.warning(
@@ -427,6 +456,8 @@ class GeminiClient(LLMClient):
                         delay,
                     )
                     time.sleep(delay)
+        if quota_hit:
+            self._embed_quota_exhausted = True
         raise LLMError(
             f"Embed call thất bại sau {self.embed_max_retries} lần thử: {last_error}"
         )

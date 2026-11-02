@@ -41,6 +41,10 @@ logger = logging.getLogger("04_embed")
 DEFAULT_CORPUS = "data/processed/corpus.jsonl"
 DEFAULT_COLLECTION = "chunks"
 
+#: Corpus / collection của các câu VHE gold (tiếng Việt cổ).  Tách riêng
+#: khỏi corpus Wikipedia vì văn phong và khoảng không thời gian khác nhau.
+VHE_CORPUS = "data/processed/vhe_corpus.jsonl"
+
 #: Namespace used to derive a deterministic UUID from a chunk id.  Qdrant
 #: only accepts unsigned integers or UUIDs as point ids, while the chunk ids
 #: of the corpus are strings such as ``ck_24731941d15b2235``.  The mapping is
@@ -179,10 +183,18 @@ def main(argv: list[str] | None = None) -> int:
 
     # Mỗi embedder có một collection riêng: vector Gemini 768 chiều không
     # thể nằm chung collection với vector cục bộ 384 chiều.
-    if args.collection == DEFAULT_COLLECTION and str(getattr(embedder, "name", "")).startswith(
-        "local:"
-    ):
-        args.collection = str(settings.qdrant.get("collection_chunks_local", "chunks_local"))
+    is_local = str(getattr(embedder, "name", "")).startswith("local:")
+    is_vhe = Path(args.corpus).name == Path(VHE_CORPUS).name
+    if args.collection == DEFAULT_COLLECTION:
+        if is_vhe:
+            args.collection = str(
+                settings.qdrant.get(
+                    "collection_chunks_vhe_local" if is_local else "collection_chunks_vhe",
+                    "chunks_vhe_local" if is_local else "chunks_vhe",
+                )
+            )
+        elif is_local:
+            args.collection = str(settings.qdrant.get("collection_chunks_local", "chunks_local"))
 
     store = make_store(args.store, settings, dim)
     try:

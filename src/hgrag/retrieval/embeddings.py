@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
@@ -191,9 +192,17 @@ def _gemini_embedding_available(client: Any) -> bool:
 
     A single tiny embedding request is enough to detect the daily-quota
     exhaustion (``HTTP 429``) of the free tier without spending real quota.
+
+    The probe text is **randomised** on purpose: the client caches the
+    embedding vectors on disk, so a fixed probe string ("ping") would be
+    answered from the cache and the probe would report "quota available"
+    even though every *real* embedding request fails with a 429.
     """
+    if getattr(client, "_embed_quota_exhausted", False):
+        return False
+    probe = f"ping-{uuid.uuid4().hex}"
     try:
-        vectors = client.embed(["ping"])
+        vectors = client.embed([probe])
     except Exception as exc:  # noqa: BLE001
         logger.info("Embedding Gemini không khả dụng: %s", str(exc)[:160])
         return False

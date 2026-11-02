@@ -57,6 +57,11 @@ qdrant:
   # Collection riêng cho vector tạo bởi model embedding *cục bộ* (384 dim).
   # Cần thiết vì collection `chunks` chứa vector 768 dim của Gemini.
   collection_chunks_local: chunks_local
+  # Collection riêng cho các câu VHE gold (tiếng Việt cổ).  Tách riêng vì
+  # (a) văn phong khác hẳn Wikipedia và (b) để pipeline QA tìm kiếm được
+  # cả hai corpus rồi gộp kết quả (xem qa/pipeline.py::_search_collections).
+  collection_chunks_vhe: chunks_vhe
+  collection_chunks_vhe_local: chunks_vhe_local
   collection_nodes: nodes
   vector_size: 768
   distance: Cosine
@@ -85,6 +90,11 @@ extraction:
 retrieval:
   vector_top_k: 30
   rerank_top_k: 10
+  # auto | heuristic | cross-encoder
+  # `auto` chỉ dùng cross-encoder khi có GPU: trên CPU nó tốn ~35s/lần gọi,
+  # khiến cả lượt đánh giá 150 câu x 11 hệ thống mất hàng giờ.
+  rerank_backend: auto
+  rerank_model: BAAI/bge-reranker-v2-m3
   graph_max_hops: 3
   graph_max_paths: 20
   graph_max_paths_per_hop: 30

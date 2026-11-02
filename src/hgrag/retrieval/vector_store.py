@@ -48,7 +48,6 @@ def _qdrant_filter(filters: dict[str, Any] | None) -> Any:
         Filter,
         MatchAny,
         MatchValue,
-        MinShould,
         Range,
     )
 
@@ -68,7 +67,11 @@ def _qdrant_filter(filters: dict[str, Any] | None) -> Any:
                         ]
                     )
                 )
-            must.append(Filter(should=clauses, min_should=MinShould(min_should=1)))
+            # A filter with only ``should`` clauses is a disjunction in
+            # Qdrant, which is exactly what "the chunk overlaps one of the
+            # years" means.  (``MinShould`` would be the explicit form but
+            # it needs Qdrant >= 1.13, while the project runs 1.12.)
+            must.append(Filter(should=clauses))
             continue
         if isinstance(value, (list, tuple, set)):
             must.append(FieldCondition(key=key, match=MatchAny(any=list(value))))

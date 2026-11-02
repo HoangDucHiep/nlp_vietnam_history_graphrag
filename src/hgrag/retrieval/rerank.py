@@ -337,7 +337,17 @@ class CrossEncoderReranker:
 
 
 def build_reranker(settings: Any = None, embedder: Any = None) -> Reranker:
-    """Build the best reranker available in this environment."""
+    """Build the best reranker available in this environment.
+
+    ``rerank_backend``:
+
+    * ``heuristic``  -- always the offline BM25-ish reranker;
+    * ``cross-encoder`` -- always the cross-encoder (needs the weights);
+    * ``auto`` (default) -- the cross-encoder **only when a GPU is
+      available**.  On CPU the cross-encoder costs ~35 s per call, which is
+      two orders of magnitude slower than the heuristic and would make a
+      full evaluation run (150 questions x 11 systems) take a day.
+    """
     heuristic = HeuristicReranker(embedder=embedder)
     if settings is None:
         return heuristic
@@ -345,7 +355,25 @@ def build_reranker(settings: Any = None, embedder: Any = None) -> Reranker:
     if cfg is None and isinstance(settings, dict):
         cfg = settings.get("retrieval")
     cfg = dict(cfg or {})
-    if str(cfg.get("rerank_backend") or "auto").lower() == "heuristic":
+    backend = str(cfg.get("rerank_backend") or "auto").lower()
+    if backend == "heuristic":
         return heuristic
     model_name = str(cfg.get("rerank_model") or "BAAI/bge-reranker-v2-m3")
+    if backend == "auto" and not _gpu_available():
+        logger.info(
+            "Không có GPU -> dùng heuristic reranker (cross-encoder quá chậm trên CPU)"
+        )
+        return heuristic
     return CrossEncoderReranker(model_name=model_name, fallback=heuristic)
+
+
+def _gpu_available() -> bool:
+    """Whether a CUDA GPU is usable by the installed torch build."""
+    try:
+        import torch
+    except Exception:  # noqa: BLE001 - torch is optional
+        return False
+    try:
+        return bool(torch.cuda.is_available())
+    except Exception:  # noqa: BLE001 - defensive
+        return False

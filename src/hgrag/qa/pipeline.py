@@ -123,6 +123,10 @@ class QAPipeline:
         self.chunk_collection = str(
             (getattr(self.settings, "qdrant", {}) or {}).get("collection_chunks", "chunks")
         )
+        # The VHE gold sentences live in their own collection: they are
+        # classical Vietnamese and must not pollute the Wikipedia vector
+        # space.  The pipeline searches *all* of them and merges the hits.
+        self.chunk_collections: list[str] = [self.chunk_collection]
         # The vector collection depends on the *active* embedder: the Gemini
         # vectors are 768-dim, a local sentence-transformers model is usually
         # 384-dim.  Mixing them in the same collection would break the search.
@@ -135,6 +139,15 @@ class QAPipeline:
         """Override the Qdrant collection used for the chunk vectors."""
         if name:
             self.chunk_collection = str(name)
+            self.chunk_collections = [self.chunk_collection]
+
+    def set_chunk_collections(self, names: Sequence[str]) -> None:
+        """Search several Qdrant collections at once (merged by score)."""
+        cleaned = [str(n) for n in (names or []) if str(n).strip()]
+        if not cleaned:
+            return
+        self.chunk_collections = cleaned
+        self.chunk_collection = cleaned[0]
 
     # ------------------------------------------------------------------
     # public API
@@ -295,19 +308,46 @@ class QAPipeline:
             )
             return self._lexical_search(question, top_k, understanding, flags)
         filters = self._filters(understanding, flags)
-        try:
-            hits = self.vector_store.search(
-                self.chunk_collection, query_vec, top_k=top_k, filters=filters or None
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Vector search thất bại: %s", exc)
-            return self._lexical_search(question, top_k, understanding, flags)
+        hits = self._search_collections(query_vec, top_k, filters)
         if not hits:
             # Không có kết quả vector -> thử tìm kiếm từ khoá trước khi kết luận.
             lexical = self._lexical_search(question, top_k, understanding, flags)
             if lexical:
                 return lexical
         return list(hits or [])
+
+    def _search_collections(
+        self,
+        query_vec: Sequence[float],
+        top_k: int,
+        filters: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        """Search every chunk collection and merge the hits.
+
+        The VHE gold corpus and the Wikipedia corpus are indexed in two
+        separate collections (different vector dimensions are not the only
+        reason: the two corpora have a very different register).  The hits of
+        the two collections are merged and re-sorted by score, so a VHE
+        sentence can compete with a Wikipedia paragraph on equal terms.
+        """
+        collections = list(self.chunk_collections or [self.chunk_collection])
+        merged: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for name in collections:
+            try:
+                hits = self.vector_store.search(
+                    name, list(query_vec), top_k=top_k, filters=filters or None
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Vector search thất bại ở collection %r: %s", name, exc)
+                errors.append(name)
+                continue
+            merged.extend(hits or [])
+        if errors and len(errors) == len(collections):
+            logger.warning("Không collection nào tìm kiếm được: %s", ", ".join(errors))
+            return []
+        merged.sort(key=lambda h: float(h.get("score", 0.0)), reverse=True)
+        return merged[:top_k]
 
     def _lexical_search(
         self,
@@ -689,7 +729,18 @@ def build_pipeline(settings: Any = None, mock: bool = False) -> QAPipeline:
         lexical_index=lexical_index,
         settings=settings,
     )
-    pipeline.set_chunk_collection(collection)
+    # The chunk corpus is split over several collections: the Wikipedia
+    # chunks and the VHE gold sentences.  Both are searched and merged.
+    collections = [collection]
+    vhe_collection = str(
+        qcfg.get(
+            "collection_chunks_vhe_local" if is_local else "collection_chunks_vhe",
+            "chunks_vhe_local" if is_local else "chunks_vhe",
+        )
+    )
+    if vhe_collection != collection:
+        collections.append(vhe_collection)
+    pipeline.set_chunk_collections(collections)
     return pipeline
 
 
