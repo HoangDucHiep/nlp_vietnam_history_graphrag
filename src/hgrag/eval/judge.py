@@ -339,6 +339,13 @@ class LLMJudge:
                     role="user",
                     content=prompt if attempt == 0 else prompt + JUDGE_RETRY_HINT,
                 )
+                # Mỗi lần chấm lại cũng **tăng** ngân sách output.  Một payload
+                # hỏng thường do model hết token giữa chừng nên rơi vào vòng
+                # lặp ("của lứa-1 của lứa-1 ...") -- đo được ở ``vhe_00010``:
+                # payload bị cắt ở 1 122 ký tự với ngân sách 512 token.  Thêm
+                # chỗ cho model viết trọn vẫn giữ nguyên cache key cũ, nhưng
+                # tạo ra cache key mới (nên không dùng lại verdict hỏng).
+                request.max_output_tokens = 512 * (2**attempt)
                 payload = self.llm_client.generate_json(request)
             except Exception as exc:  # noqa: BLE001 - the judge must never crash the run
                 last_exc = exc
@@ -640,4 +647,28 @@ def _is_self_consistent(payload: dict[str, Any]) -> bool:
             counts[sentence] = counts.get(sentence, 0) + 1
         if max(counts.values()) >= 2:
             return False
+    # Degenerate repetition at the *phrase* level: the model runs out of
+    # output budget and loops ("Đáp án ứng viên-1 của lứa-1 của lứa-1 ...").
+    # Such a payload is cut in the middle of a sentence, so the sentence-level
+    # check above cannot see it.  A repeated n-gram is the reliable signal.
+    if _has_repeated_ngram(reason):
+        return False
     return True
+
+
+def _has_repeated_ngram(reason: str, n: int = 3, min_repeats: int = 4) -> bool:
+    """Whether ``reason`` contains the same n-gram repeated many times.
+
+    The degeneration observed in the cache is a *loop* of a short phrase
+    ("của lứa-1") -- the payload is truncated by the output budget in the
+    middle of the loop, so no sentence repeats.  Counting the n-grams catches
+    it: the loop makes one n-gram appear many times.
+    """
+    tokens = re.findall(r"\S+", reason.lower())
+    if len(tokens) < n * min_repeats:
+        return False
+    counts: dict[str, int] = {}
+    for index in range(len(tokens) - n + 1):
+        gram = " ".join(tokens[index : index + n])
+        counts[gram] = counts.get(gram, 0) + 1
+    return max(counts.values()) >= min_repeats

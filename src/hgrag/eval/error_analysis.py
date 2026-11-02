@@ -13,6 +13,7 @@ Usage
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,8 @@ ERROR_TYPES: tuple[str, ...] = (
     "generation_wrong_despite_evidence",
     "judge_mismatch",
     "out_of_kb_hallucination",
-    "refused_when_answerable",
+    "refused_because_retrieval_failed",
+    "refused_despite_evidence",
     "citation_invalid",
     "bad_question",
     "other",
@@ -43,7 +45,8 @@ ERROR_LABELS: dict[str, str] = {
     "generation_wrong_despite_evidence": "Sinh sai dù có evidence",
     "judge_mismatch": "Judge lệch",
     "out_of_kb_hallucination": "Bịa ở câu ngoài KB",
-    "refused_when_answerable": "Từ chối nhầm câu trả lời được",
+    "refused_because_retrieval_failed": "Từ chối vì truy xuất hụt",
+    "refused_despite_evidence": "Từ chối dù đã có evidence",
     "citation_invalid": "Trích dẫn không hợp lệ",
     "bad_question": "Câu hỏi lỗi (ngoài KB / sai lệch)",
     "other": "Lỗi khác",
@@ -56,7 +59,8 @@ ERROR_ROOTS: dict[str, str] = {
     "generation_wrong_despite_evidence": "Prompt chưa ràng buộc đủ / context quá dài",
     "judge_mismatch": "Rubric chưa rõ / đáp án tham chiếu chưa sắc",
     "out_of_kb_hallucination": "Thiếu cơ chế từ chối khi không có evidence",
-    "refused_when_answerable": "Ngân sách context quá chặt / evidence bị lọc hết",
+    "refused_because_retrieval_failed": "Đồ thị/vector chưa dựng được đường tới đáp án vàng",
+    "refused_despite_evidence": "Đáp án vàng đã có trong CONTEXT nhưng mô hình vẫn từ chối",
     "citation_invalid": "Mô hình sinh [E#] không tồn tại / evidence thiếu text",
     "bad_question": "Câu hỏi tự nó sai lệch lịch sử hoặc nằm ngoài phạm vi kho",
     "other": "Cần xem thủ công",
@@ -96,6 +100,29 @@ def _reason_says_ungrounded_answer(reason: str) -> bool:
     return any(marker in lowered for marker in _UNGROUNDED_ANSWER_MARKERS)
 
 
+def _gold_in_context(row: EvalRow) -> bool:
+    """Whether the gold answer is present in the evidence of the row.
+
+    The rows only keep the *identifiers* of the retrieved chunks and the
+    *names* of the nodes of the retrieved paths -- not the text.  For the
+    refusal cases that is enough: the gold answer is a VHE node name, so it
+    shows up in the node names of a retrieved path.
+    """
+    gold = M.normalize_text(row.reference or "")
+    if not gold:
+        return False
+    haystack = " ".join(
+        M.normalize_text(" ".join(str(n) for n in path))
+        for path in (row.retrieved_paths or [])
+    )
+    if not haystack:
+        return False
+    if gold in haystack:
+        return True
+    parts = [p for p in re.split(r"[;,\s]+", gold) if len(p) > 2]
+    return bool(parts) and all(part in haystack for part in parts)
+
+
 def classify_error(row: EvalRow, question_type: str = "") -> str:
     """Classify one failed answer into an error category.
 
@@ -118,7 +145,13 @@ def classify_error(row: EvalRow, question_type: str = "") -> str:
         # penalising the system for that would be unfair.
         return "bad_question"
     if row.refused and question_type != "out_of_kb":
-        return "refused_when_answerable"
+        # Từ chối một câu hỏi *trả lời được*: nguyên nhân gốc có thể nằm ở
+        # tầng truy xuất (đồ thị/vector chưa dựng được đường tới đáp án vàng)
+        # hoặc ở tầng sinh (đáp án vàng đã có trong CONTEXT nhưng mô hình vẫn
+        # từ chối).  Hai loại này cần hướng khắc phục khác nhau nên được tách.
+        if _gold_in_context(row):
+            return "refused_despite_evidence"
+        return "refused_because_retrieval_failed"
     if markers and not row.citation_precision:
         return "citation_invalid"
     if not has_evidence:

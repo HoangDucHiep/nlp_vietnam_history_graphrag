@@ -967,7 +967,21 @@ def test_classify_error_detects_refusal_on_answerable_question() -> None:
     from hgrag.eval.error_analysis import classify_error
 
     row = _row(refused=True, answer="Tôi không tìm thấy đủ thông tin trong kho.")
-    assert classify_error(row, "single_hop") == "refused_when_answerable"
+    assert classify_error(row, "single_hop") == "refused_because_retrieval_failed"
+
+
+def test_classify_error_separates_refusal_with_the_gold_in_the_paths() -> None:
+    """Từ chối khi đường đi **đã chứa** đáp án vàng là lỗi *sinh*, không phải
+    lỗi truy xuất -- hai nguyên nhân cần hướng khắc phục khác nhau."""
+    from hgrag.eval.error_analysis import classify_error
+
+    row = _row(
+        refused=True,
+        answer="Tôi không tìm thấy đủ thông tin trong kho.",
+        reference="Đế Nghi",
+        retrieved_paths=[["Đế Minh", "Đế Minh sinh ra Đế Nghi", "Đế Nghi"]],
+    )
+    assert classify_error(row, "single_hop") == "refused_despite_evidence"
 
 
 def test_classify_error_detects_out_of_kb_hallucination() -> None:
@@ -1011,5 +1025,69 @@ def test_analyze_errors_counts_categories() -> None:
     run = EvalRun(rows=rows, meta={})
     analysis = analyze_errors(run, "ours")
     assert analysis["n_failures"] == 2
-    assert analysis["counts"]["refused_when_answerable"] == 1
+    assert analysis["counts"]["refused_because_retrieval_failed"] == 1
     assert analysis["counts"]["bad_question"] == 1
+
+
+def test_llm_judge_rejects_a_looped_ngram_reason() -> None:
+    """Lý do lặp *cụm* (không lặp câu) cũng phải bị loại.
+
+    Đây là dạng hỏng đo được trên cache thật (``vhe_00010``): payload bị cắt
+    ở giữa vòng lặp ``"của lứa-1 của lứa-1 ..."`` nên **không** có câu nào
+    lặp lại, và bộ kiểm tra ở mức câu không bắt được.
+    """
+
+    class _Looped:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_json(self, request):  # noqa: D102
+            self.calls += 1
+            return {
+                "score": 2,
+                "correct": True,
+                "grounded": True,
+                "supported_evidence_ids": ["E2"],
+                "reason": (
+                    "Đáp án ứng viên-1 " + "của lứa-1 " * 12 + "của lứa-1."
+                ),
+            }
+
+    client = _Looped()
+    verdict = LLMJudge(client, max_retries=2, retry_base_delay=0.0).grade(
+        question="q", answer="Trận Bạch Đằng", reference="Trận Bạch Đằng"
+    )
+    assert client.calls == 2
+    assert verdict.source == "heuristic"
+    assert verdict.degraded is True
+
+
+def test_llm_judge_grows_the_output_budget_on_retry() -> None:
+    """Lần chấm lại phải **tăng** ngân sách output.
+
+    Payload hỏng thường là do model hết token giữa chừng rồi rơi vào vòng
+    lặp.  Tăng ngân sách cho model viết trọn (và tạo cache key mới) là cách
+    sửa trực tiếp nhất.
+    """
+
+    class _Budget:
+        def __init__(self) -> None:
+            self.budgets: list[int] = []
+
+        def generate_json(self, request):  # noqa: D102
+            self.budgets.append(request.max_output_tokens)
+            return {
+                # Verdict tự mâu thuẫn -> judge phải chấm lại, và mỗi lần
+                # chấm lại phải có ngân sách output lớn hơn.
+                "score": 0,
+                "correct": False,
+                "grounded": False,
+                "supported_evidence_ids": [],
+                "reason": "Đáp án đúng hoàn toàn so với đáp án tham chiếu.",
+            }
+
+    client = _Budget()
+    LLMJudge(client, max_retries=3, retry_base_delay=0.0).grade(
+        question="q", answer="a", reference="r"
+    )
+    assert client.budgets == [512, 1024, 2048]
