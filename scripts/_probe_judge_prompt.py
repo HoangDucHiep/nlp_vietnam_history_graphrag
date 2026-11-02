@@ -113,7 +113,6 @@ def main() -> int:
         print("không tìm thấy dòng")
         return 1
 
-    from hgrag.eval.judge import _render_evidence
 
     gold = row.get("_gold_facts") or []
     if isinstance(gold, str):

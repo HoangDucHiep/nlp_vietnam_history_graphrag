@@ -20,7 +20,6 @@ from hgrag.eval.judge import (  # noqa: E402
     JUDGE_TEMPLATE,
     _is_self_consistent,
 )
-from hgrag.llm.schemas import LLMMessage, LLMRequest  # noqa: E402
 
 QID = os.environ.get("PROBE_QID", "vhe_00001")
 SYSTEM = os.environ.get("PROBE_SYSTEM", "ours")

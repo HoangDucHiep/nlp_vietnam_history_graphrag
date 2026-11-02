@@ -31,15 +31,11 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from hgrag.config import get_settings  # noqa: E402
-from hgrag.kg.alias import AliasResolver  # noqa: E402
 from hgrag.kg.store import Neo4jGraphStore  # noqa: E402
 from hgrag.llm.client import build_llm_client  # noqa: E402
 from hgrag.llm.schemas import LLMMessage, LLMRequest  # noqa: E402
-from hgrag.qa.pipeline import QAPipeline, build_pipeline  # noqa: E402
+from hgrag.qa.pipeline import build_pipeline  # noqa: E402
 from hgrag.retrieval.embeddings import build_embedder  # noqa: E402
-from hgrag.retrieval.entity_linker import EntityLinker  # noqa: E402
-from hgrag.retrieval.graph_search import GraphSearcher  # noqa: E402
-from hgrag.retrieval.rerank import build_reranker  # noqa: E402
 from hgrag.retrieval.vector_store import QdrantVectorStore  # noqa: E402
 
 logger = logging.getLogger("09_live_check")

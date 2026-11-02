@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -489,8 +490,25 @@ def build_report(
     reports_dir: str | Path,
     comparisons: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Write every artefact of the report and return their paths."""
+    """Write every artefact of the report and return their paths.
+
+    A *smaller* run never overwrites a bigger one: a mini evaluation (the
+    smoke test runs 3 questions in mock mode) would otherwise silently
+    replace the report of the full 1 650-row run with a 12-row one.  In that
+    case the artefacts are written to a sibling directory (``reports/small``)
+    and the original report is left untouched.
+    """
     reports = Path(reports_dir)
+    existing_rows = _rows_in_report(reports)
+    if existing_rows and len(run.rows) < existing_rows:
+        logger.warning(
+            "%s đã chứa báo cáo của %d dòng (> %d dòng của lượt chạy này) -- "
+            "ghi sang thư mục phụ để không ghi đè",
+            reports,
+            existing_rows,
+            len(run.rows),
+        )
+        reports = reports.parent / f"{reports.name}_small"
     reports.mkdir(parents=True, exist_ok=True)
     csv_path = write_results_csv(run, reports / "results.csv")
     md_path = write_results_markdown(run, reports / "results.md", comparisons)
@@ -506,6 +524,38 @@ def build_report(
         "error_analysis": str(error_path),
         "figures": [str(f) for f in figures],
     }
+
+
+def _rows_in_report(reports_dir: Path) -> int:
+    """Number of scored rows behind an existing report (0 when absent).
+
+    ``results.csv`` là bảng **tổng hợp** theo (hệ thống × nhóm câu hỏi) nên
+    số dòng của nó không phải số lượt chấm.  Số lượt chấm thật nằm trong
+    ``results.md`` (``Tổng số lượt chấm: **N**``).
+    """
+    md_path = reports_dir / "results.md"
+    if not md_path.exists():
+        return 0
+    try:
+        text = md_path.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    match = re.search(r"Tổng số lượt chấm:\s*\*\*(\d+)\*\*", text)
+    if match:
+        return int(match.group(1))
+    # Báo cáo cũ (đã sinh trước khi thêm dòng tiêu đề) -> dùng CSV làm dự phòng.
+    return _csv_data_rows(reports_dir / "results.csv")
+
+
+def _csv_data_rows(csv_path: Path) -> int:
+    """Number of data rows in a CSV file (0 when absent or unreadable)."""
+    if not csv_path.exists():
+        return 0
+    try:
+        with csv_path.open(encoding="utf-8") as handle:
+            return max(sum(1 for _ in handle) - 1, 0)
+    except OSError:
+        return 0
 
 
 _SYSTEM_LABELS: dict[str, str] = {
