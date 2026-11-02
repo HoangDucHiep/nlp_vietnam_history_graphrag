@@ -126,7 +126,10 @@ class DiskCache:
     def put(self, key: str, value: dict[str, Any]) -> None:
         p = self._path(key)
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
+        # The temporary name carries the PID so that several evaluation
+        # workers can write the same cache directory concurrently without
+        # clobbering each other's partial file.
+        tmp = p.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(p)
 
@@ -200,6 +203,10 @@ class GeminiClient(LLMClient):
         # until every model is exhausted (then the list is reset, so a
         # quota reset is picked up automatically).
         self._exhausted_models: set[str] = set()
+        # Models that answered "429, retry after N seconds": they are only
+        # rate limited for a few seconds, so they get a short cooldown
+        # instead of being dropped like an exhausted model.
+        self._throttled: dict[str, float] = {}
 
     # -- helpers ---------------------------------------------------------
     def _cache_key(self, request: LLMRequest) -> str:
@@ -262,6 +269,21 @@ class GeminiClient(LLMClient):
         if not models_to_try:
             self._exhausted_models.clear()
             models_to_try = [request.model or self.model, *self.fallback_models]
+        # A model that answered "429, retry after N s" is only *rate limited*
+        # for a few seconds.  The free tier applies the requests-per-minute
+        # quota *per model*, so rotating to another model is much faster than
+        # sleeping.  The throttled model is put on a short cooldown and is
+        # picked up again later.
+        now = time.monotonic()
+        cooled = [m for m in models_to_try if self._throttled.get(m, 0.0) <= now]
+        if cooled:
+            models_to_try = cooled
+        else:
+            # Every model is cooling down: wait for the first one to free up.
+            wait_for = min(self._throttled.get(m, 0.0) for m in models_to_try) - now
+            if wait_for > 0:
+                logger.info("Mọi model đều bị giới hạn tốc độ -- chờ %.1fs", wait_for)
+                time.sleep(min(wait_for + 0.5, self.max_rate_limit_wait))
         for model_name in models_to_try:
             for attempt in range(self.max_retries):
                 try:
@@ -301,13 +323,16 @@ class GeminiClient(LLMClient):
                         # ngày thì chuyển sang model dự phòng.
                         wait = _retry_after_seconds(exc)
                         if wait is not None and wait <= self.max_rate_limit_wait:
+                            # Chỉ bị giới hạn tốc độ: đưa model này vào cooldown
+                            # và thử model kế tiếp ngay (mỗi model có quota
+                            # RPM riêng).
+                            self._throttled[model_name] = time.monotonic() + wait
                             logger.warning(
-                                "Gemini bị giới hạn tốc độ (model=%s) -- chờ %.1fs rồi thử lại",
+                                "Gemini giới hạn tốc độ (model=%s, %.0fs) -- chuyển model khác",
                                 model_name,
                                 wait,
                             )
-                            time.sleep(wait)
-                            continue
+                            break
                         logger.warning(
                             "Gemini quota hết cho model %s -> chuyển model khác", model_name
                         )
@@ -328,7 +353,6 @@ class GeminiClient(LLMClient):
                     )
                     time.sleep(delay)
         raise LLMError(f"Gemini call thất bại sau khi thử {models_to_try}: {last_error}")
-
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Embed ``texts`` (batched), retrying on rate-limit errors.
 

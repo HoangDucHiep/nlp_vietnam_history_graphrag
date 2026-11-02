@@ -464,7 +464,11 @@ def build_report(
     csv_path = write_results_csv(run, reports / "results.csv")
     md_path = write_results_markdown(run, reports / "results.md", comparisons)
     figures = make_figures(run, reports / "figures")
-    error_path = write_error_analysis(run, reports / "error_analysis.md")
+    error_path = write_error_analysis(
+        run,
+        reports / "error_analysis.md",
+        systems=[s for s in ("ours", "B1", "B0") if s in {r.system for r in run.rows}],
+    )
     return {
         "results_csv": str(csv_path),
         "results_md": str(md_path),
