@@ -251,6 +251,19 @@ kiểm soát" của từng bước.
     cạnh *tiếp giáp* node nhưng `src`/`dst` luôn mô tả **đúng hướng thật** của
     quan hệ.  `InMemoryGraphStore` cũ hoán đổi `src`/`dst` khi `uid == dst`
     (`src == dst`, mất quan hệ đi vào) → sửa để khớp `Neo4jGraphStore`.
+11. **Lượt đánh giá nhỏ không được ghi đè lượt đánh giá lớn** — smoke test chạy
+    3 câu ở chế độ mock và mặc định ghi ra `artifacts/eval_run.json` + `reports/`,
+    đã âm thầm thay artefact **1 650 dòng** bằng **12 dòng**.  Báo cáo markdown
+    vẫn giữ số liệu đúng (vì được commit trước đó) nhưng artefact raw thì mất.
+    Cách sửa:
+    - `build_report()` đọc số lượt chấm từ `results.md`; nếu lượt mới có **ít
+      hơn** lượt đã có thì ghi sang thư mục phụ `reports_small/`,
+    - `07_run_eval.py` ghi `.secondary` thay vì đè `eval_run.json`,
+    - `08_smoke_test.sh` ghi kết quả mini ra `/tmp`.
+    Sau khi sửa, artefact 1 650 dòng được **tái lập byte-identical** từ các
+    checkpoint `artifacts/eval_ckpt_{main,b,c,d}.json` bằng
+    `scripts/12_merge_eval.py` — đây cũng là cách kiểm chứng rằng số liệu
+    trong báo cáo là tái lập được từ dữ liệu thô.
 
 ## 6. Điều kiện tiên quyết & rủi ro lịch
 

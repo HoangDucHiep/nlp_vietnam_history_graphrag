@@ -381,3 +381,21 @@ verdict thật: bản cũ loại 51 verdict (31 loại oan), bản mới loại 
 không phải chạy lại toàn bộ đánh giá (câu trả lời đã cache nên không tốn
 quota sinh đáp án).
 
+### 7.3 Một lỗi ở tầng *artefact* (không ảnh hưởng số liệu, nhưng phá tính tái lập)
+
+| # | Triệu chứng | Nguyên nhân gốc | Cách sửa |
+|---|---|---|---|
+| **6** | `artifacts/eval_run.json` chỉ còn **12 dòng mock** thay vì 1 650 dòng thật | `scripts/08_smoke_test.sh` gọi `07_run_eval.py --mock --limit 3` **không chỉ định `--out`/`--reports`**, nên nó ghi đè đúng artefact của lượt đánh giá đầy đủ | `build_report()` đọc số lượt chấm từ `results.md` và **từ chối ghi đè** lượt lớn hơn (ghi sang `reports_small/`); `07_run_eval.py` ghi `.secondary`; `08_smoke_test.sh` ghi ra `/tmp` |
+
+Số liệu trong `reports/results.md` và `reports/error_analysis.md` **không bị
+ảnh hưởng** vì chúng đã được commit trước khi lỗi xảy ra.  Artefact 1 650 dòng
+được tái lập **byte-identical** từ các checkpoint
+`artifacts/eval_ckpt_{main,b,c,d}.json` (450 + 450 + 450 + 300 dòng) bằng
+`scripts/12_merge_eval.py` — đây là cách kiểm chứng trực tiếp rằng
+`reports/results.csv` **tái lập được từ dữ liệu thô**, đúng yêu cầu cuối của
+mục "Definition of Done".
+
+> **Bài học rút ra**: mọi script chạy thử (smoke test, probe) đều phải ghi ra
+> đường dẫn riêng.  Chỉ `scripts/run_all.sh` mới được quyền ghi vào
+> `reports/` và `artifacts/eval_run.json`.
+
