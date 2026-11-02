@@ -210,6 +210,78 @@ là đúng, trong khi rubric LLM chấm theo *ngữ nghĩa*.  Rơi về heuristi
 đúng bị báo cáo là sai.  Vì vậy bộ lọc phải **bảo thủ**: chỉ loại khi mâu thuẫn
 *không nghi ngờ* được, và lần chấm lại phải thực sự khác prompt.
 
+## 6b. Embedder không khớp corpus: mất toàn bộ VHE gold (2026-11-03)
+
+### 6b.1 Triệu chứng
+
+Chạy `scripts/06_ask.py` / `scripts/09_live_check.py` ngoài khung đánh giá thì
+log báo:
+
+```
+WARNING hgrag.qa.pipeline: Vector search thất bại ở collection 'chunks_vhe':
+  Not found: Collection `chunks_vhe` doesn't exist!
+```
+
+và câu hỏi về Trần Hưng Đạo **không tìm được câu trả lời có căn cứ** (chỉ còn
+bằng chứng Wikipedia, mất phần VHE gold).
+
+### 6b.2 Nguyên nhân
+
+Hai lớp collection trong Qdrant:
+
+| Collection | Số chiều | Nguồn |
+|---|---|---|
+| `chunks`, `chunks_vhe` | 768 | vector Gemini (`gemini-embedding-2`) |
+| `chunks_local`, `chunks_vhe_local` | 384 | vector cục bộ (MiniLM đa ngôn ngữ) |
+
+Lượt đánh giá chạy với `HGRAG_EMBED_PROVIDER=local` nên corpus **thực tế** được
+đánh chỉ mục bằng vector 384 chiều.  Nhưng `build_embedder()` ở chế độ `auto`
+**dò quota** Gemini trước: nếu quota còn (hoặc bộ đệm còn sống), nó trả về
+embedder Gemini 768 chiều.  Pipeline sau đó tìm collection 768 chiều — vốn
+**không tồn tại** trong Qdrant của lượt chạy này — nên:
+
+* `chunks_vhe` → 404 (collection không có);
+* `chunks` → có, nhưng chỉ chứa 438 đoạn Wikipedia, **không** có 4 110 câu VHE
+  gold (nhóm câu hỏi chính của bộ đánh giá).
+
+Nói cách khác: pipeline im lặng đánh đổi *toàn bộ* VHE gold lấy một vài
+trăm đoạn Wikipedia.
+
+### 6b.3 Cách khắc phục
+
+`src/hgrag/qa/pipeline.py::_resolve_corpus()` đối chiếu **collection đang tồn tại
+thật** trong Qdrant (qua `VectorStore.collection_exists` / `collection_dim` mới
+thêm) với số chiều của embedder đang dùng:
+
+1. ưu tiên nhóm collection có **cùng số chiều** với embedder hiện tại;
+2. nếu không nhóm nào khớp → **đổi embedder** sang nhóm còn lại (local ↔ Gemini)
+   để vector truy vấn luôn khớp corpus;
+3. nếu Qdrant không kiểm tra được → giữ tên collection theo cấu hình.
+
+Sau bản vá này log chỉ còn:
+
+```
+INFO hgrag.qa.pipeline: Vector search dùng 2 collection: chunks_local, chunks_vhe_local (dim=384)
+```
+
+### 6b.4 Bài học
+
+Quota embedding của Gemini cạn **không đồng nghĩa** vector trong kho đã đổi.
+Dò quota chỉ nói "API còn trả lời được", còn kho vector là **trạng thái đã
+ghi**.  Pipeline phải lấy trạng thái đã ghi làm chuẩn, không dùng trạng thái
+API làm chuẩn.
+
+### 6b.5 `FinishReason.RECITATION`: Gemma trả body rỗng dù đã retry
+
+Ngoài `MAX_TOKENS`, Gemma 4 còn trả `finish_reason=RECITATION` với `text` rỗng
+(kênh suy luận lặp nội dung huấn luyện rồi bị chặn).  Bản vá trước đây chỉ
+*thử lại* với ngân sách lớn hơn rồi trả về body rỗng cho pipeline, khiến bước
+disambiguate thất bại (`LLM did not return valid JSON`).
+
+Sửa: nếu body **vẫn rỗng sau lần thử lại** và còn model dự phòng → **chuyển
+sang model tiếp theo** thay vì trả về câu rỗng
+(`src/hgrag/llm/client.py`, `GeminiClient.generate`).
+
 ## 7. Cách tái lập các phép đo
 
 ```bash
