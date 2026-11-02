@@ -415,6 +415,17 @@ class GeminiClient(LLMClient):
         return False
 
     @staticmethod
+    def _empty_reason(resp: Any) -> str:
+        """A short description of why a response came back empty."""
+        candidates = getattr(resp, "candidates", None) or []
+        if not candidates:
+            return "không có candidate"
+        reasons = [
+            str(getattr(cand, "finish_reason", "") or "?") for cand in candidates
+        ]
+        return ", ".join(reasons)
+
+    @staticmethod
     def _expanded_output_budget(current: int) -> int:
         """The budget to retry with when thinking overran ``current``.
 
@@ -632,15 +643,20 @@ class GeminiClient(LLMClient):
                     # docs/10 cho thấy đây là nguyên nhân 65/110 câu closed-book
                     # rỗng.  Ta phát hiện tình huống này và **thử lại với
                     # ngân sách lớn hơn** trước khi bỏ cuộc.
-                    if not text.strip() and self._is_thinking_overrun(resp):
-                        retry_budget = self._expanded_output_budget(
-                            request.max_output_tokens or self.max_output_tokens
-                        )
-                        if retry_budget > (request.max_output_tokens or self.max_output_tokens):
+                    #
+                    # Một câu trả lời rỗng cũng có thể do nguyên nhân khác
+                    # (response không có candidate, bị chặn an toàn, ...), nên
+                    # điều kiện thử lại là "rỗng" chứ không chỉ "hết ngân
+                    # sách token".
+                    if not text.strip():
+                        current_budget = request.max_output_tokens or self.max_output_tokens
+                        retry_budget = self._expanded_output_budget(current_budget)
+                        if retry_budget > current_budget:
                             logger.warning(
-                                "Mô hình %s hết ngân sách token khi suy luận "
-                                "(text rỗng) -- thử lại với max_output_tokens=%d",
+                                "Mô hình %s trả về câu trả lời rỗng (%s) -- thử lại "
+                                "với max_output_tokens=%d",
                                 model_name,
+                                self._empty_reason(resp),
                                 retry_budget,
                             )
                             config = {**config, "max_output_tokens": retry_budget}
@@ -663,7 +679,10 @@ class GeminiClient(LLMClient):
                         if usage
                         else {},
                     }
-                    if self.cache is not None:
+                    if self.cache is not None and text.strip():
+                        # A *failed* call (empty body) must never enter the
+                        # cache: the next run would read the empty answer back
+                        # and never call the API again.
                         self.cache.put(key, payload)
                     return LLMResponse(text=text, model=model_name, cached=False, raw=payload)
                 except Exception as exc:  # noqa: BLE001

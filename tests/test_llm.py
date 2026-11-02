@@ -776,3 +776,41 @@ class TestGeminiThinkingOverrun:
         resp = client.generate(_req("judge"))
         assert resp.text == "ok"
         assert len(models.calls) == 1
+
+    def test_retries_an_empty_answer_without_max_tokens(self, monkeypatch, tmp_path: Path):
+        """Một response rỗng vì lý do khác (không có candidate) cũng phải
+        được thử lại: nếu không, câu trả lời bị mất hoàn toàn."""
+
+        def _behaviour(kwargs: Any):
+            if len(models.calls) == 1:
+                return SimpleNamespace(text="", candidates=[], usage_metadata=None)
+            return _ok_response("câu trả lời")
+
+        models = _install_fake_genai(monkeypatch, _behaviour)
+        client = GeminiClient(model="gemini-test", api_key="k", cache_dir=tmp_path / "cache")
+        resp = client.generate(_req("judge"))
+        assert resp.text == "câu trả lời"
+        assert len(models.calls) == 2
+
+    def test_an_empty_answer_is_never_cached(self, monkeypatch, tmp_path: Path):
+        """Response rỗng là một *lỗi*, không phải một kết quả.
+
+        Nếu nó được ghi vào cache thì mọi lượt chạy sau sẽ đọc lại câu trả lời
+        rỗng và không bao giờ gọi lại API.
+        """
+        cache_dir = tmp_path / "cache"
+        models = _install_fake_genai(
+            monkeypatch,
+            lambda kwargs: SimpleNamespace(
+                text="", candidates=[], usage_metadata=None
+            ),
+        )
+        client = GeminiClient(model="gemini-test", api_key="k", cache_dir=cache_dir)
+        resp = client.generate(_req("judge"))
+        assert resp.text == ""
+        assert list(cache_dir.glob("*/*.json")) == []
+
+        # Lượt gọi sau phải gọi lại API (không đọc từ cache).
+        models.calls.clear()
+        client.generate(_req("judge"))
+        assert len(models.calls) == 2
