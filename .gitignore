@@ -22,8 +22,11 @@ artifacts/
 *.db
 
 # reports generated
-reports/figures/*.png
-reports/results.csv
+# `reports/results.csv` và `reports/figures/*.png` là **sản phẩm bàn giao**
+# của lượt đánh giá 1 650 lượt chấm -> phải được version cùng báo cáo
+# (`reports/results.md`, `reports/error_analysis.md`) để số liệu luôn tái lập
+# được từ mã nguồn.  Chỉ các artefact trung gian (checkpoint, cache LLM,
+# log) mới bị loại trừ vì chúng lớn và tái sinh được.
 
 # notebooks
 .ipynb_checkpoints/
