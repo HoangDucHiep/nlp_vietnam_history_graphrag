@@ -21,6 +21,22 @@
 
 **Tổng mục tiêu: ~180 câu.**
 
+### 2.1.1 Rubric chấm câu **ngoài phạm vi KB** (nguồn D)
+
+Câu hỏi ngoài phạm vi **không có** đáp án tham chiếu, nên không thể chấm "đúng/sai"
+theo nghĩa.  Tiêu chí chấm là **hành vi**:
+
+| Hành vi của hệ thống | Điểm | Lý do |
+|---|---|---|
+| **Từ chối trả lời** | `2` (đúng, grounded) | Đúng đắn: không bịa nội dung ngoài KB |
+| **Cố trả lời / bịa đặt** | `0` (sai, không grounded) | Lỗi nghiêm trọng nhất của hệ thống có KB |
+
+Cơ chế nhận diện từ chối (`eval/judge.py::looks_like_refusal`) dùng danh sách cụm từ
+**đặc hiệu** ("không tìm thấy đủ thông tin", "ngoài phạm vi", "không đủ căn cứ"…)
+để không nhầm với câu trả lời hợp lệ có câu "chưa có thông tin nào về năm này".
+Đây chính là chỗ mà baseline **closed-book (B0)** thua: không có KB thì không có
+cách biết câu hỏi nằm ngoài phạm vi.
+
 ### 2.2 Schema một câu hỏi
 
 ```json
@@ -44,6 +60,28 @@
 ### 2.3 Quy trình human-verify
 
 Giao diện Streamlit có tab **"Duyệt câu hỏi"**: hiển thị câu hỏi + đoạn nguồn → nút `Duyệt` / `Sửa` / `Bỏ`. Chỉ câu `verified=true` mới vào bộ đánh giá cuối. Ghi trong báo cáo: "180 câu, 142 được duyệt" → minh bạch.
+
+### 2.4 Bộ câu hỏi đã sinh (thực tế)
+
+| Nguồn | Số câu | Ghi chú |
+|---|---|---|
+| A. Template từ gold relation VHE | 88 | gold path **tự động kiểm chứng**; 121 câu có gold path, 40 câu có gold chunk |
+| B. Gemini sinh từ chunk Wikipedia | 30 | |
+| C. Vietnam History Chat | 10 | |
+| D. Out-of-KB (viết tay) | 22 | chấm theo **hành vi** (§2.1.1) |
+| **Tổng** | **150** | 60 single-hop · 45 multi-hop · 23 temporal · 22 out-of-KB |
+
+**Gold path đã được kiểm chứng lại với KG thật**:
+
+```bash
+python scripts/10_validate_eval_paths.py   # đo tỉ lệ gold path khớp node trong Neo4j
+python scripts/11_fix_eval_paths.py        # chuẩn hoá gold path theo tên node thật
+```
+
+Kết quả: **97,7% exact match** (98,67% khi so khớp chuỗi con) — trước khi chuẩn hoá
+chỉ có 68,1%.  Các câu còn lại (4 câu) là node VHE chưa được nạp vào đồ thị con;
+chúng vẫn được giữ trong bộ đánh giá nhưng `path_hit` của chúng không tính vào
+mẫu số (xem quy tắc "applicable" ở §3.3).
 
 ## 3. Metrics
 
@@ -78,6 +116,14 @@ Giao diện Streamlit có tab **"Duyệt câu hỏi"**: hiển thị câu hỏi 
 | **Path hit rate** | đường đi truy xuất có chứa gold_path hay không ← **chỉ số riêng cho multi-hop** |
 | **Temporal accuracy** | với câu hỏi có năm: evidence có chứa event đúng năm không |
 
+> **Quy tắc "applicable" (quan trọng):** câu hỏi **không có** gold path /
+> gold chunk không thể bị trượt đường đi / không thể bị sót chunk → những câu
+> đó **không được tính vào mẫu số** của `path_hit` và `chunk_recall_at_10`
+> (cờ `path_applicable` / `chunk_applicable` trong `eval/run_eval.py`).
+> Nếu không áp dụng quy tắc này, chỉ số bị hạ thấp oan vì câu hỏi không có gold.
+> Tương tự, **groundedness của B0 (closed-book) là không áp dụng** (không có
+> context để đối chiếu) → báo cáo hiển thị "–".
+
 ### 3.4 Vận hành
 
 - Latency p50 / p95 (ms) theo từng giai đoạn (linking / vector / graph / generation).
@@ -96,12 +142,17 @@ Giao diện Streamlit có tab **"Duyệt câu hỏi"**: hiển thị câu hỏi 
 
 | Mã | Hệ thống | Mô tả |
 |---|---|---|
-| **B0** | LLM-only | Không truy xuất, chỉ kiến thức mô hình |
+| **B0** | LLM-only | Không truy xuất, chỉ kiến thức mô hình. Cài đặt: prompt **closed-book** riêng (`CLOSED_BOOK_SYSTEM_PROMPT`) — không CONTEXT, không citation `[E#]`. Judge chỉ chấm độ đúng (groundedness = không áp dụng) |
 | **B1** | Vanilla RAG | Vector search top-k trên cùng corpus, cùng rerank, cùng prompt sinh đáp án. **Không dùng đồ thị** ← baseline bắt buộc |
 | **B2** | RAG + GraphRAG không có rerank | Để tách đóng góp của rerank |
 | **Ours** | Hybrid GraphRAG đầy đủ | Vector + đồ thị + rerank + fusion + context budget + entity resolution |
 
 > B1 phải dùng **cùng chunk, cùng embedding model, cùng LLM, cùng prompt** → khác biệt là do kiến trúc.
+>
+> **Lưu ý khi đọc bảng**: B0 là baseline *closed-book*, nên nó **trả lời** (không
+> từ chối) cho mọi câu hỏi trong phạm vi lịch sử. Ở nhóm `out_of_kb`, hành vi
+> đúng là **từ chối**, nên B0 bị trừ điểm ở nhóm đó (đó chính là điểm mà một
+> hệ thống có KB thắng được).
 
 ### 4.2 Ablation (bỏ từng thành phần của Ours)
 

@@ -24,11 +24,11 @@ subgraph để kiểm chứng.
 
 ```mermaid
 flowchart LR
-  subgraph offline["Ngoại tuyến (1 lần)"]
-    ING["Wikipedia + VHE + History Chat<br/>→ corpus.jsonl (438 chunk)"]
+  subgraph offline["Ngoài tuyến (1 lần)"]
+    ING["Wikipedia + VHE + History Chat<br/>→ corpus.jsonl (438 chunk)<br/>+ vhe_corpus.jsonl (4.110 câu)"]
     EXT["Gemini trích xuất event<br/>theo ontology VHE 35 type / 11 role"]
-    KG[("Neo4j<br/>714 node · 1405 edge")]
-    VEC[("Qdrant<br/>embedding 768 chiều")]
+    KG[("Neo4j<br/>18.634 node · 36.214 edge")]
+    VEC[("Qdrant<br/>chunks 768d · chunks_local 384d<br/>chunks_vhe_local 4.110 pt")]
   end
   subgraph online["Truy vấn"]
     QU["Query Understanding"]
@@ -81,14 +81,15 @@ bash scripts/run_all.sh
 
 | Bước | Lệnh | Đầu ra |
 |---|---|---|
-| 1 | `python scripts/01_ingest.py` | `data/processed/corpus.jsonl` |
-| 2 | `python scripts/03_build_kg.py --limit 120` | Neo4j + `artifacts/kg_stats.json` |
-| 3 | `python scripts/04_embed.py` | Qdrant `chunks` + `artifacts/embed_stats.json` |
+| 1 | `python scripts/01_ingest.py` | `data/processed/corpus.jsonl` + `vhe_corpus.jsonl` |
+| 2 | `python scripts/03_build_kg.py --vhe` | Neo4j (đồ thị con VHE gold + đồ thị Wikipedia) + `artifacts/kg_stats.json` |
+| 3 | `python scripts/04_embed.py` | Qdrant `chunks` / `chunks_local` / `chunks_vhe_local` + `artifacts/embed_stats*.json` |
 | 4 | `python scripts/05_eval_dataset.py` | `data/processed/eval_questions.jsonl` (150 câu) |
-| 5 | `python scripts/06_ask.py "câu hỏi"` | câu trả lời + `[E#]` + subgraph |
-| 6 | `python scripts/07_run_eval.py` | `reports/results.csv`, `reports/results.md`, `reports/figures/` |
-| 7 | `bash scripts/08_smoke_test.sh` | kiểm tra offline toàn hệ thống |
-| 8 | `python scripts/09_live_check.py` | kiểm tra dịch vụ thật (Gemini/Neo4j/Qdrant) |
+| 5 | `python scripts/10_validate_eval_paths.py` | `artifacts/eval_path_validation.json` (gold path ↔ KG) |
+| 6 | `python scripts/06_ask.py "câu hỏi"` | câu trả lời + `[E#]` + subgraph |
+| 7 | `python scripts/07_run_eval.py` | `reports/results.csv`, `reports/results.md`, `reports/figures/` |
+| 8 | `bash scripts/08_smoke_test.sh` | kiểm tra offline toàn hệ thống |
+| 9 | `python scripts/09_live_check.py` | kiểm tra dịch vụ thật (Gemini/Neo4j/Qdrant) |
 | — | `streamlit run src/hgrag/app/streamlit_app.py` | giao diện demo 5 tab |
 
 Mọi bước **idempotent** và **có cache**: chạy lại không tốn tiền LLM.
@@ -104,14 +105,14 @@ vietnam_history_graphrag/
 │   ├── config.py                  # Settings: YAML + env override
 │   ├── llm/       client.py schemas.py prompts.py
 │   ├── data/      wikipedia.py vhe.py history_chat.py chunking.py normalize.py wikidata.py ingest.py
-│   ├── kg/        ontology.py alias.py extractor.py builder.py store.py
-│   ├── retrieval/ embeddings.py vector_store.py entity_linker.py graph_search.py fusion.py context.py rerank.py
+│   ├── kg/        ontology.py labels.py alias.py extractor.py builder.py store.py vhe_gold.py
+│   ├── retrieval/ embeddings.py vector_store.py entity_linker.py graph_search.py fusion.py context.py rerank.py lexical.py
 │   ├── qa/        query_understanding.py answer.py explain.py pipeline.py
-│   ├── eval/      dataset.py dataset_builder.py metrics.py judge.py run_eval.py report.py
+│   ├── eval/      dataset.py dataset_builder.py metrics.py judge.py run_eval.py report.py error_analysis.py
 │   └── app/       streamlit_app.py
 ├── scripts/       00_up.sh 00_down.sh 01_ingest.py 03_build_kg.py 04_embed.py
 │                  05_eval_dataset.py 06_ask.py 07_run_eval.py 08_smoke_test.sh
-│                  09_live_check.py run_all.sh
+│                  09_live_check.py 10_validate_eval_paths.py 11_fix_eval_paths.py run_all.sh
 ├── tests/         test_data.py test_llm.py test_kg.py test_retrieval.py test_qa.py test_eval.py test_app.py
 ├── data/          raw/ processed/
 ├── artifacts/     llm_cache/ extractions/ *.json
@@ -120,16 +121,16 @@ vietnam_history_graphrag/
 
 ## 5. Định danh thực thể (QID-first)
 
-Bảy tầng, dừng sớm khi đủ tin cậy:
+Sáu tầng (T0–T5), dừng sớm khi đủ tin cậy:
 
-| Tầng | Nguồn | Ngưỡng |
+| Tầng | Nguồn | Điểm |
 |---|---|---|
-| T0 | Wikidata QID đã biết | khớp tuyệt đối |
-| T1 | Wikidata alias tiếng Việt (`skos:altLabel[vi]`) | `name_key` khớp |
-| T2 | Wikipedia `prop=redirects` (lọc theo quan hệ họ hàng) | `0.9` |
-| T3 | LLM xác minh alias (`task="verify_alias"`) | `0.85` |
-| T4 | Chuẩn hóa chuỗi (bỏ dấu, bỏ honorific, NFC) | `0.8` |
-| T5 | Embedding top-k + lọc miền (P31 / P27 / trùng thời gian) | `0.75` |
+| T0 | QID đã biết / node đã có trong KG | `1.00` |
+| T1 | Wikidata alias tiếng Việt (`skos:altLabel[vi]`, `wbsearchentities`) | `0.97` |
+| T2 | Wikipedia `prop=redirects` | `0.93` |
+| T3 | LLM xác minh redirect (`task="verify_alias"`) | `0.90` |
+| T4 | Chuẩn hóa chuỗi (bỏ dấu, bỏ honorific, NFC) | `0.85` |
+| T5 | Embedding top-k + lọc miền (P31 / P27 / trùng thời gian) + LLM phân giải | `0.60–0.90` |
 
 Chi tiết đầy đủ: [`docs/07_xac_dinh_thuc_the.md`](docs/07_xac_dinh_thuc_the.md).
 
@@ -137,6 +138,7 @@ Chi tiết đầy đủ: [`docs/07_xac_dinh_thuc_the.md`](docs/07_xac_dinh_thuc_
 
 Bộ câu hỏi 150 câu từ 4 nguồn (`vhe_template`, `llm_from_wiki`, `history_chat`,
 `out_of_kb`), chia 4 nhóm (`single_hop`, `multi_hop`, `temporal`, `out_of_kb`).
+Gold path của 121 câu đã được **chuẩn hoá theo KG thật** (97,7% exact match).
 
 ```bash
 python scripts/07_run_eval.py                 # đầy đủ (B0/B1/B2/Ours + 7 ablation)
@@ -161,16 +163,21 @@ Test tự động chặn network (fixture `block_network`); test cần mạng ph
 
 ## 8. Ghi chú về quota Gemini (free tier)
 
-* Mỗi model Flash có quota ~20 request/ngày → client **xoay model** khi gặp HTTP 429.
+* Mỗi model Flash có quota ~20 request/ngày → client **xoay model** khi gặp HTTP 429,
+  và **ghi nhớ** model đã cạn (`_exhausted_models`) để không phải trả giá một lần gọi
+  thất bại cho mỗi request.
 * **Quota embedding là độc lập** với quota chat. Khi model embedding chính hết quota,
   client **fail fast** (không ngủ tới lúc reset ~20 giờ) rồi **chuyển sang model
-  embedding dự phòng** (`gemini-embedding-2`). Khi đó corpus phải được embed lại
-  bằng đúng model mới (`python scripts/04_embed.py`) để không gian vector nhất quán.
+  embedding dự phòng**; nếu mọi model embedding đều cạn thì dùng model **cục bộ**
+  `paraphrase-multilingual-MiniLM-L12-v2` (384 chiều) và corpus được embed lại
+  bằng đúng model mới để không gian vector nhất quán.
+* **Reranker**: `bge-reranker-v2-m3` mất ~35 s/lần gọi trên CPU. `rerank_backend: auto`
+  tự phát hiện CUDA → có GPU dùng cross-encoder, không có GPU dùng heuristic reranker.
 * Mọi lời gọi LLM **và embedding** được cache đĩa tại `artifacts/llm_cache/`
   (khoá theo nội dung + model) → chạy lại **không tốn quota**.
 * Run đánh giá dài hỗ trợ **checkpoint + resume**:
   ```bash
-  python scripts/07_run_eval.py --checkpoint artifacts/eval_ckpt.json
+  python scripts/07_run_eval.py --checkpoint artifacts/eval_checkpoint.json
   ```
   Khi bị 429 giữa chừng, chạy lại lệnh trên sẽ bỏ qua các cặp `(system, qid)`
   đã chấm xong.

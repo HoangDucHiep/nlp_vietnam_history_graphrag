@@ -189,12 +189,12 @@ kiểm soát" của từng bước.
 
 | Hạng mục | Kế hoạch | Thực tế | Ghi chú |
 |---|---|---|---|
-| Corpus (chunk) | ≥ 3.000 chunk | **438 chunk / 120 doc** | Đã lọc theo phạm vi 905–1975 + nội dung "sự kiện"; số chunk nhỏ hơn kế hoạch vì quota Gemini giới hạn số bài Wikipedia mở rộng được |
-| KG node | ≥ 5.000 | **714 node** (293 event + entity/person/place/period) | Quy mô theo corpus thực tế |
-| KG edge | ≥ 15.000 | **1.405 edge** | Mỗi edge có `source_chunk_ids` + quan hệ `[:SUPPORTED_BY]` tới Chunk (793 liên kết provenance) |
-| Vector store | khớp số chunk | **438/438 point** trong collection `chunks` (768 chiều, Cosine) | Embedding qua `gemini-embedding-2` (`output_dimensionality=768`) |
-| Bộ câu hỏi | ≥ 150 câu verified | **150 câu** (60 single-hop, 45 multi-hop, 23 temporal, 22 out-of-KB) | 88 từ VHE template, 30 từ Wikipedia, 10 History-Chat, 22 out-of-KB |
-| Test | 100% | **298 test pass**, `ruff check` sạch | `pytest -q` |
+| Corpus (chunk) | ≥ 3.000 chunk | **438 chunk / 120 doc** (Wikipedia/LLM) + **4.110 câu VHE** | Đã lọc theo phạm vi 905–1975 + nội dung "sự kiện"; số chunk nhỏ hơn kế hoạch vì quota Gemini giới hạn số bài Wikipedia mở rộng được. VHE gold được nạp thành corpus riêng (`data/processed/vhe_corpus.jsonl`) |
+| KG node | ≥ 5.000 | **18.634 node** | 2.435 entity (Wikipedia/LLM) + 12.089 entity (VHE gold) + 4.110 `:Chunk` provenance |
+| KG edge | ≥ 15.000 | **36.214 edge** | 5.217 quan hệ (Wikipedia/LLM) + 30.997 quan hệ (VHE gold) + cạnh `[:SUPPORTED_BY]` nối entity/event → `:Chunk` |
+| Vector store | khớp số chunk | `chunks` 438 pt (768 chiều) · `chunks_local` 438 pt (384) · `chunks_vhe_local` 4.110 pt (384) | Embedding Gemini đã cạn quota → dùng model **cục bộ** `paraphrase-multilingual-MiniLM-L12-v2` (384 chiều) |
+| Bộ câu hỏi | ≥ 150 câu verified | **150 câu** (60 single-hop, 45 multi-hop, 23 temporal, 22 out-of-KB) | 88 từ VHE template, 30 từ Wikipedia, 10 History-Chat, 22 out-of-KB. Gold path đã được chuẩn hoá lại theo KG thật: **97,7% exact match** (98,67% substring) |
+| Test | 100% | **310 test pass**, `ruff check` sạch | `pytest -q` |
 | Smoke test | script chạy được | `scripts/08_smoke_test.sh` xanh | Kiểm tra import / test / dịch vụ / corpus / mock ask / mock eval |
 | Live check | dịch vụ thật | `scripts/09_live_check.py` xanh | Gemini + Neo4j + Qdrant + QA end-to-end có citation hợp lệ |
 
@@ -213,9 +213,29 @@ kiểm soát" của từng bước.
    đúng 1 vector cho cả batch; client phát hiện thiếu vector và tự tách thành
    các lệnh gọi đơn lẻ.
 3. **Eval dài trên free tier** — `run_evaluation` hỗ trợ **checkpoint + resume**
-   (`--checkpoint artifacts/eval_ckpt.json`): mỗi N dòng đã chấm được ghi ra
+   (`--checkpoint artifacts/eval_checkpoint.json`): mỗi N dòng đã chấm được ghi ra
    đĩa, chạy lại sẽ bỏ qua cặp `(system, qid)` đã có.  Điều này bảo đảm một
    lần chạy 1650 lượt (150 câu × 11 hệ thống) không bị mất trắng khi gặp 429.
+4. **Circuit breaker cho quota chat** — `GeminiClient._exhausted_models` ghi nhớ
+   các model đã hết quota để **không** phải trả giá một lần gọi thất bại cho
+   mỗi request (một lượt đánh giá 1.650 dòng × vài giây/lần gọi là mất hàng
+   giờ).  Khi **mọi** model cạn, danh sách được reset để nhận lại quota khi
+   nó reset theo ngày.
+5. **Reranker trên CPU** — `bge-reranker-v2-m3` mất ~35 s/lần gọi trên CPU, tức
+   ~16 giờ cho một lượt đánh giá đầy đủ.  `rerank_backend: auto` **tự phát hiện
+   CUDA**: có GPU → cross-encoder, không có → `HeuristicReranker` (BM25 + boost
+   thời gian + cosine).  Kết quả đo được trên CPU là của hệ thống *đã cấu
+   hình lại*, và điều này được ghi rõ trong báo cáo.
+6. **Đồ thị con VHE gold** — chú giải VHE được nạp thành một đồ thị con riêng
+   (12.089 entity + 30.997 quan hệ) cạnh đồ thị Wikipedia/LLM, kèm cạnh
+   `[:SUPPORTED_BY]` trỏ tới `:Chunk` để mọi khẳng định đều truy vết được
+   về câu nguồn.  `scripts/10_validate_eval_paths.py` đo tỉ lệ gold path khớp
+   node thật; `scripts/11_fix_eval_paths.py` chuẩn hoá lại gold path theo KG.
+7. **Metric "applicable"** — câu không có gold path / gold chunk **không** bị
+   tính là trượt: `path_hit` và `chunk_recall_at_10` chỉ được lấy trung bình
+   trên nhóm câu hỏi có gold tương ứng (`path_applicable` / `chunk_applicable`).
+   Tương tự, groundedness của **B0 (closed-book)** là *không áp dụng* vì không
+   có context để đối chiếu → báo cáo hiển thị "–".
 
 ## 6. Điều kiện tiên quyết & rủi ro lịch
 
