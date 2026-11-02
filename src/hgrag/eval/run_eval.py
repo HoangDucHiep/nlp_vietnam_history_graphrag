@@ -89,6 +89,10 @@ class EvalRow:
     #: baseline answers closed-book: there is no context to check the claims
     #: against, so the groundedness of B0 is reported as "–" (n/a).
     grounded_applicable: bool = True
+    #: Whether the judge reached the LLM.  When it did not, the verdict fell
+    #: back to the deterministic token-F1 heuristic, which is *not*
+    #: comparable with the LLM verdicts of the other rows.
+    judge_degraded: bool = False
     linked_entities: list[str] = field(default_factory=list)
     retrieved_paths: list[list[str]] = field(default_factory=list)
     retrieved_chunks: list[str] = field(default_factory=list)
@@ -123,6 +127,7 @@ class EvalRow:
             "path_applicable": self.path_applicable,
             "chunk_applicable": self.chunk_applicable,
             "grounded_applicable": self.grounded_applicable,
+            "judge_degraded": self.judge_degraded,
             "linked_entities": list(self.linked_entities),
             "retrieved_paths": list(self.retrieved_paths),
             "retrieved_chunks": list(self.retrieved_chunks),
@@ -247,6 +252,7 @@ def _score_row(
         path_applicable=bool(question.gold_paths),
         chunk_applicable=bool(question.gold_chunk_ids),
         grounded_applicable=(system != "B0"),
+        judge_degraded=bool(getattr(verdict, "degraded", False)),
         linked_entities=linked_entities,
         retrieved_paths=retrieved_paths,
         retrieved_chunks=retrieved_chunks,
@@ -327,6 +333,7 @@ def run_evaluation(
 
     total = len(questions) * len(plan)
     done = 0
+    degraded = 0
     for system, ablation in plan:
         for question in questions:
             done += 1
@@ -345,11 +352,25 @@ def run_evaluation(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Chấm câu %s (%s) lỗi: %s", question.qid, system, exc)
                 continue
+            if row.judge_degraded:
+                degraded += 1
             run.rows.append(row)
             if checkpoint_path and len(run.rows) % max(1, checkpoint_every) == 0:
                 _save_checkpoint(checkpoint_path, run)
     if checkpoint_path:
         _save_checkpoint(checkpoint_path, run)
+    if degraded:
+        # A degraded verdict is a token-F1 overlap instead of a semantic
+        # grading.  Mixing the two kinds of score in one table would make the
+        # comparison between the systems meaningless, so the run is flagged.
+        logger.warning(
+            "⚠ %d/%d dòng bị chấm bằng heuristic (LLM judge không truy cập được) "
+            "-- kết quả KHÔNG đáng tin cậy cho báo cáo",
+            degraded,
+            len(run.rows),
+        )
+    run.meta["n_degraded"] = degraded
+    run.meta["judge_source"] = "llm" if degraded == 0 else "mixed"
     return run
 
 

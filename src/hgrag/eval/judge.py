@@ -170,6 +170,11 @@ class JudgeResult:
     supported_evidence_ids: list[str] = field(default_factory=list)
     reason: str = ""
     source: str = "heuristic"
+    #: ``True`` when the judge could *not* reach the LLM and the verdict fell
+    #: back to the deterministic heuristic.  Such a verdict is much weaker
+    #: (it is a token-F1 overlap, not a semantic grading), so the evaluation
+    #: harness reports it instead of silently mixing the two kinds of score.
+    degraded: bool = False
 
     @property
     def accuracy(self) -> float:
@@ -227,7 +232,7 @@ class LLMJudge:
         )
         payload = self._ask(prompt)
         if payload is None:
-            return HeuristicJudge().grade(
+            fallback = HeuristicJudge().grade(
                 question=question,
                 answer=answer,
                 reference=reference,
@@ -236,6 +241,8 @@ class LLMJudge:
                 out_of_kb=out_of_kb,
                 closed_book=closed_book,
             )
+            fallback.degraded = True
+            return fallback
         result = _result_from_payload(payload)
         if closed_book:
             result.grounded = True
@@ -298,6 +305,7 @@ class HeuristicJudge:
             supported_evidence_ids=supported,
             reason=f"heuristic token-F1={f1:.3f}",
             source="heuristic",
+            degraded=True,
         )
 
 

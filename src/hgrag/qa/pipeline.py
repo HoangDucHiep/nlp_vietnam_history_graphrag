@@ -693,6 +693,12 @@ def build_pipeline(settings: Any = None, mock: bool = False) -> QAPipeline:
         embedder=embedder,
         settings=settings,
     )
+    # The vectors of the ~14 000 indexed entities are cached on disk: without
+    # the cache every start of the harness pays a 4-minute CPU embedding pass.
+    try:
+        resolver.enable_embed_cache(settings.artifacts / "alias_embeddings.json")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không bật được alias embed cache: %s", exc)
     # The fuzzy tiers (T1 alias, T2 redirect, T4 name_key, T5 embedding) need
     # the alias index; without it the resolver can only do the exact-name
     # lookup of tier 0.

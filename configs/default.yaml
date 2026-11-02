@@ -10,13 +10,27 @@ paths:
 
 llm:
   provider: auto            # auto | gemini | openai | mock
-  # Quota theo *ngày* của free tier: khi model chính cạn, client tự chuyển
-  # sang các model dự phòng dưới đây.
-  model: gemini-flash-lite-latest
+  # Quota free tier của Google AI Studio:
+  #   * các model Gemini (flash/flash-lite) -- 20 (flash) hoặc 500 (lite)
+  #     request **mỗi ngày**, và hết sạch khi nhiều worker chạy song song;
+  #   * các model Gemma -- 30 request **mỗi phút**, bucket quota riêng biệt,
+  #     nên vẫn dùng được khi quota ngày của Gemini đã cạn.
+  # Vì vậy model chính là Gemma (bền vững), còn Gemini là dự phòng.
+  model: gemma-4-26b-a4b-it
   fallback_models:
+    - gemini-flash-lite-latest
     - gemini-3.5-flash
     - gemini-3.8-flash
     - gemini-3.1-flash-lite
+  # Giới hạn req/phút của từng model, để client tự giãn nhịp gọi thay vì
+  # ăn 429 rồi xoay vòng (mỗi lần 429 đều đốt quota của model dự phòng).
+  model_rpm:
+    gemma-4-26b-a4b-it: 28
+    gemma-4-31b-it: 28
+    gemini-flash-lite-latest: 14
+    gemini-3.5-flash: 14
+    gemini-3.8-flash: 14
+    gemini-3.1-flash-lite: 14
   embed_model: gemini-embedding-2
   # Quota của model embedding là độc lập với quota chat.  Khi model chính
   # cạn, client chuyển sang model dự phòng -- khi đó corpus phải được

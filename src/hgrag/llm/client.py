@@ -20,14 +20,21 @@ import math
 import os
 import random
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from ..data.records import stable_hash
+from .rate_limit import SharedRateLimiter
 from .schemas import LLMMessage, LLMRequest, LLMResponse
 
 _YEAR_RE = re.compile(r"\b(9\d{2}|1[0-9]{3})\b")
+
+
+def _slug(text: str) -> str:
+    """A file-system safe name for a model id."""
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", text) or "model"
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +169,7 @@ class GeminiClient(LLMClient):
         embed_max_retries: int = 8,
         max_rate_limit_wait: float = 90.0,
         fallback_embed_models: list[str] | None = None,
+        model_rpm: dict[str, int] | None = None,
     ):
         try:
             from google import genai  # type: ignore
@@ -207,15 +215,63 @@ class GeminiClient(LLMClient):
         # rate limited for a few seconds, so they get a short cooldown
         # instead of being dropped like an exhausted model.
         self._throttled: dict[str, float] = {}
+        # Per-model requests-per-minute limiter.  The free tier applies an
+        # RPM quota *per model* (30/min for the Gemma models, 15/min for the
+        # Flash-Lite ones).  Proactively spacing the calls avoids the 429
+        # round-trip, which costs far more than the wait itself.
+        self._model_rpm = dict(model_rpm or {})
+        self._call_times: dict[str, list[float]] = {}
+        self._rpm_lock = threading.Lock()
+        # The quota is global per project+model, so the limiter is shared
+        # between the worker processes through a lock file.
+        self._rate_limit_dir = (
+            Path(cache_dir).parent / "rate_limits"
+            if cache_dir
+            else Path(os.getenv("HGRAG_RATE_LIMIT_DIR", "artifacts/rate_limits"))
+        )
+        self._shared_limiters: dict[str, SharedRateLimiter] = {}
 
     # -- helpers ---------------------------------------------------------
     def _cache_key(self, request: LLMRequest) -> str:
-        return stable_hash(request.to_dict())
+        # The *primary* model is part of the key: when the model of the run
+        # changes (e.g. from Gemini to Gemma because the Gemini free-tier
+        # quota is exhausted) the answers of the previous model must not be
+        # reused, otherwise the comparison between the systems would mix two
+        # different generators.
+        return stable_hash({**request.to_dict(), "model": self.model})
 
     def _split_system(self, messages: list[LLMMessage]) -> tuple[str, str]:
         system = "\n\n".join(m.content for m in messages if m.role == "system")
         rest = "\n\n".join(m.content for m in messages if m.role != "system")
         return system, rest
+
+    def _wait_for_rpm(self, model_name: str) -> None:
+        """Block until a slot is free under the RPM quota of ``model_name``.
+
+        The free tier counts the requests of the *last minute*; spacing the
+        calls out is much cheaper than eating a 429 and rotating away (the
+        rotation burns the quota of the sibling models for nothing).
+
+        The quota is *global* (per project and per model), so the limiter is
+        shared between the worker processes through a small lock file --
+        otherwise every worker would apply the limit on its own and the sum
+        would exceed the quota.
+        """
+        rpm = self._model_rpm.get(model_name)
+        if not rpm or rpm <= 0:
+            return
+        shared = self._shared_limiters.get(model_name)
+        if shared is None:
+            shared = SharedRateLimiter(
+                self._rate_limit_dir / f"{_slug(model_name)}.json", rpm
+            )
+            self._shared_limiters[model_name] = shared
+        shared.acquire()
+        with self._rpm_lock:
+            now = time.monotonic()
+            times = [t for t in self._call_times.get(model_name, []) if now - t < 60.0]
+            times.append(now)
+            self._call_times[model_name] = times
 
     # -- API -------------------------------------------------------------
     @staticmethod
@@ -287,6 +343,7 @@ class GeminiClient(LLMClient):
         for model_name in models_to_try:
             for attempt in range(self.max_retries):
                 try:
+                    self._wait_for_rpm(model_name)
                     kwargs: dict[str, Any] = {"model": model_name, "contents": prompt}
                     if system:
                         kwargs["config"] = {
@@ -682,6 +739,7 @@ def build_llm_client(settings: Any | None = None) -> LLMClient:
                 output_dim=settings.embed_dim,
                 fallback_models=llm_cfg.get("fallback_models", []),
                 fallback_embed_models=llm_cfg.get("fallback_embed_models", []),
+                model_rpm=llm_cfg.get("model_rpm", {}),
             )
         except LLMError as exc:
             logger.warning("Không khởi tạo được GeminiClient (%s) -> dùng mock", exc)

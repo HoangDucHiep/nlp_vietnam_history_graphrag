@@ -635,6 +635,9 @@ def build_client_for_mode(settings: Any, mode: str) -> Any:
                 cache_dir=settings.cache_dir,
                 cache_enabled=llm_cfg.get("cache_enabled", True),
                 output_dim=settings.embed_dim,
+                fallback_models=llm_cfg.get("fallback_models", []),
+                fallback_embed_models=llm_cfg.get("fallback_embed_models", []),
+                model_rpm=llm_cfg.get("model_rpm", {}),
             )
         except Exception as exc:  # noqa: BLE001
             st.warning(f"Không khởi tạo được GeminiClient ({exc}) -- dùng mock.")

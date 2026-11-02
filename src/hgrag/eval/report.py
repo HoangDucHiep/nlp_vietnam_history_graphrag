@@ -301,6 +301,16 @@ def write_results_markdown(
         for key, value in config.items():
             parts.append(f"| {key} | {value} |")
         parts.append("")
+    n_degraded = int(meta.get("n_degraded", 0) or 0)
+    if n_degraded:
+        parts += [
+            "> ⚠️ **Cảnh báo**: "
+            f"{n_degraded}/{len(run.rows)} lượt chấm rơi về heuristic vì LLM judge "
+            "không truy cập được (hết quota). Các điểm số của những dòng đó là "
+            "token-F1 overlap, **không so sánh được** với điểm LLM của các dòng "
+            "còn lại — cần chạy lại để có kết quả đáng tin cậy.",
+            "",
+        ]
     parts += [
         "> Các số liệu dưới đây được sinh tự động từ `artifacts/eval_run.json` "
         "bằng `scripts/07_run_eval.py`; có thể tái lập bằng "

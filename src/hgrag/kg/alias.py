@@ -36,11 +36,14 @@ explicitly:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from ..data.normalize import name_key, strip_diacritics
@@ -386,6 +389,12 @@ class AliasResolver:
         self._key_index: dict[str, list[str]] = {}
         self._qid_index: dict[str, str] = {}
         self._embed_cache: dict[str, list[float]] = {}
+        # The tier-5 scorer needs the vector of *every* indexed entity.  With
+        # ~14 000 entities that is a 4-minute CPU embedding pass on every
+        # start of the evaluation harness, so the vectors are cached on disk
+        # (keyed by the embedder name + the text) and reused.
+        self._embed_cache_path: Path | None = None
+        self._embed_cache_dirty = False
         # memoisation of the (expensive) network-backed lookups
         self._redirect_cache: dict[str, list[str]] = {}
         self._search_cache: dict[str, Any] = {}
@@ -394,6 +403,44 @@ class AliasResolver:
     # ------------------------------------------------------------------
     # index
     # ------------------------------------------------------------------
+    def enable_embed_cache(self, path: str | Path | None) -> None:
+        """Persist the entity vectors on disk (see ``_embed_cache_path``)."""
+        self._embed_cache_path = Path(path) if path else None
+        if self._embed_cache_path and self._embed_cache_path.exists():
+            try:
+                payload = json.loads(self._embed_cache_path.read_text(encoding="utf-8"))
+                vectors = payload.get("vectors") or {}
+                self._embed_cache = {
+                    str(k): [float(x) for x in v] for k, v in vectors.items()
+                }
+                logger.info(
+                    "Alias embed cache: %d vector từ %s",
+                    len(self._embed_cache),
+                    self._embed_cache_path.name,
+                )
+            except (json.JSONDecodeError, OSError, ValueError) as exc:
+                logger.warning("Không đọc được alias embed cache (%s)", exc)
+
+    def save_embed_cache(self) -> None:
+        """Write the entity vectors to disk (if a cache path was set)."""
+        path = self._embed_cache_path
+        if path is None or not self._embed_cache:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(
+                json.dumps(
+                    {"embedder": str(getattr(self.embedder, "name", "")),
+                     "vectors": self._embed_cache},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+        except OSError as exc:  # pragma: no cover - best effort
+            logger.warning("Không ghi được alias embed cache: %s", exc)
+
     def build_alias_index(self, entities: Iterable[Any]) -> None:
         """(Re)build the alias index from a collection of entities.
 
@@ -985,6 +1032,7 @@ class AliasResolver:
                 vectors = []
             for text, vec in zip(texts, vectors, strict=False):
                 self._embed_cache[text] = [float(x) for x in vec]
+            self.save_embed_cache()
         scored: list[tuple[float, _Record]] = []
         for record in records:
             vector = self._embed_cache.get(self._embed_text(record))
