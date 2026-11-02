@@ -234,6 +234,36 @@ Sau khi sửa, cả ba câu trả lời đúng:
 > Test chốt lại quy tắc: `tests/test_retrieval.py::test_graph_path_natural_text_quotes_the_evidence`
 > và `::test_graph_path_edge_carries_the_evidence_sentence`.
 
+### 5.1.4 Diversity cap không được loại đường đi đồ thị (bắt buộc)
+
+`apply_diversity_cap` giới hạn ≤ `max_evidence_per_doc = 3` evidence cho mỗi
+`doc_id` để tránh 5 đoạn về cùng một bài.  Nhưng **đường đi đồ thị không phải
+đoạn văn** nên không có `doc_id`: chúng rơi vào cùng một nhóm giả `"__nodoc__"`,
+và chỉ **ba đường đi đầu tiên** lọt vào context dù traversal tìm ra nhiều hơn.
+Đường đi chứa **đáp án vàng** có thể rơi ngoài ba đường đi đó — tức là hệ
+thống *đã tìm thấy* đáp án rồi lại bỏ nó khỏi context.
+
+Đo trên `vhe_00013` ("Trong sự kiện do Nhà Tần thực hiện, đối tượng được
+nhắc đến là gì?", đáp án vàng **Nam Hải**):
+
+| | evidence | đường đi đồ thị | đáp án vàng trong context |
+|---|---|---|---|
+| trước | 6 | 3 (E2, E6, E8) | **không** |
+| sau | 12 | 6 (E2…E12) | **có** |
+
+Hai thay đổi trong `retrieval/fusion.py`:
+
+1. **`_diversity_key()`** tách đường đi đồ thị ra khỏi nhóm chung: mỗi đường
+   đi đếm vào nhóm riêng, khoá bằng chuỗi `uid` của các node ⇒ cap vẫn giới
+   hạn đoạn văn trùng lặp mà không đụng tới đường đi.
+2. **`dedupe_by_text()`** loại các mục có **text trùng nhau**: traversal có thể
+   đi tới cùng một chuỗi cạnh qua nhiều đường (`Nhà Tần - ABOUT -> giải thể`
+   xuất hiện hai lần).  Lặp lại câu giống nhau chỉ tốn ngân sách context và
+   khiến LLM tưởng sự kiện được nói hai lần.
+
+> Test chốt lại quy tắc: `tests/test_retrieval.py::test_diversity_cap_does_not_evict_the_graph_paths`
+> và `::test_dedupe_by_text_drops_identical_items`.
+
 ### 5.2 Chấm điểm đường đi
 
 \[
@@ -260,7 +290,8 @@ Mỗi đường đi → 1 evidence với:
 
 - **RRF**: \(score(d) = \sum_{list} \frac{1}{k + rank_{list}(d)}\), `k = rrf_k = 60`, giữa list `vector` và list `graph`. RRF chỉ cần *thứ hạng* nên hợp nhất được list cosine (vector) với list điểm path (graph) vốn khác thang đo.
 - **Boost thời gian**: `+ temporal_boost = 0.15` nếu evidence chứa năm trùng câu hỏi (dùng `year_refs` của Query Understanding).
-- **Ưu tiên đa dạng**: giới hạn ≤ `max_evidence_per_doc = 3` evidence từ cùng một `doc_id` → tránh 5 đoạn về cùng một bài (đây chính là "prompt bị nhiễu" gây giảm accuracy trong HisGraphRAG).
+- **Ưu tiên đa dạng**: giới hạn ≤ `max_evidence_per_doc = 3` evidence từ cùng một `doc_id` → tránh 5 đoạn về cùng một bài (đây chính là "prompt bị nhiễu" gây giảm accuracy trong HisGraphRAG).  **Đường đi đồ thị không có `doc_id` nên được tính vào nhóm riêng** — xem §5.1.4.
+- **Loại trùng lặp**: `dedupe_by_text()` bỏ các evidence có text giống hệt nhau trước khi chọn `max_evidence` (§5.1.4).
 - **Ngân sách token**: `max_evidence = 12` evidence, tổng ≤ `context_max_tokens = 6000` → cắt theo điểm (thiếu ngân sách = ablation A6).
 - Bỏ fusion (chỉ dùng vector top-k) = ablation A7.
 
