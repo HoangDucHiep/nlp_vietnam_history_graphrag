@@ -37,7 +37,7 @@ def main() -> None:
     print("nodes that merge   :", nodes_merged)
 
     type_conflicts = Counter()
-    for key, group in multi.items():
+    for _key, group in multi.items():
         types = sorted({r["t"] for r in group})
         type_conflicts["+".join(types)] += 1
     print()
@@ -48,7 +48,7 @@ def main() -> None:
     print()
     print("examples (same name, different type):")
     shown = 0
-    for key, group in multi.items():
+    for _key, group in multi.items():
         types = sorted({r["t"] for r in group})
         if len(types) > 1 and shown < 15:
             print(f"   {group[0]['name']!r}: {[(r['uid'], r['t']) for r in group]}")

@@ -177,6 +177,27 @@ def main(argv: list[str] | None = None) -> int:
     out_path = Path(args.out) if args.out else (settings.artifacts / "eval_run.json")
     if not out_path.is_absolute():
         out_path = REPO_ROOT / out_path
+
+    # Không được âm thầm ghi đè một lượt đánh giá *lớn hơn*.  Lượt mini (ví dụ
+    # smoke test chạy 3 câu ở chế độ mock) sẽ ghi ra ít dòng hơn và làm mất
+    # artefact của lượt đầy đủ -- số liệu đã báo cáo vẫn còn trong
+    # `reports/`, nhưng `artifacts/eval_run.json` thì không.
+    if out_path.exists():
+        try:
+            existing = json.loads(out_path.read_text(encoding="utf-8"))
+            n_existing = len(existing.get("rows") or [])
+        except (json.JSONDecodeError, OSError):
+            n_existing = 0
+        if n_existing > len(run.rows):
+            logger.warning(
+                "%s đã chứa %d dòng (> %d dòng của lượt chạy này) -- "
+                "không ghi đè; lưu sang %s.secondary",
+                out_path,
+                n_existing,
+                len(run.rows),
+                out_path,
+            )
+            out_path = out_path.with_suffix(out_path.suffix + ".secondary")
     run.save(out_path)
 
     summary = {

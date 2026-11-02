@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from hgrag.eval.dataset import EvalDataset, EvalQuestion, load_jsonl
@@ -36,6 +38,7 @@ from hgrag.eval.metrics import (
 from hgrag.eval.run_eval import (
     ABLATIONS,
     EvalRow,
+    EvalRun,
     compare_systems,
     run_evaluation,
     summarize_run,
@@ -1091,3 +1094,75 @@ def test_llm_judge_grows_the_output_budget_on_retry() -> None:
         question="q", answer="a", reference="r"
     )
     assert client.budgets == [512, 1024, 2048]
+
+
+# --------------------------------------------------------------------------
+# report: a smaller run must never overwrite a bigger one
+# --------------------------------------------------------------------------
+
+
+def _report_rows(n: int, qid_prefix: str = "q") -> list[EvalRow]:
+    return [
+        EvalRow(
+            qid=f"{qid_prefix}{i}",
+            system="ours",
+            question="câu hỏi",
+            question_type="single_hop",
+            source="vhe",
+            answer="đáp án",
+            reference="đáp án",
+            judge_score=2,
+            judge_correct=True,
+            grounded=True,
+        )
+        for i in range(n)
+    ]
+
+
+def test_build_report_does_not_overwrite_a_bigger_report(tmp_path) -> None:
+    """Lượt chạy nhỏ (smoke test) không được xoá báo cáo của lượt lớn.
+
+    Đây là hậu quả thật đã xảy ra: smoke test chạy 3 câu ở chế độ mock đã ghi
+    đè ``artifacts/eval_run.json`` (1 650 dòng -> 12 dòng) và ``reports/``.
+    """
+    from hgrag.eval.report import build_report
+
+    reports = tmp_path / "reports"
+    build_report(EvalRun(rows=_report_rows(40), meta={}), reports)
+    big_md = (reports / "results.md").read_text(encoding="utf-8")
+    big_csv = (reports / "results.csv").read_text(encoding="utf-8")
+    assert "Tổng số lượt chấm: **40**" in big_md
+
+    artefacts = build_report(EvalRun(rows=_report_rows(3), meta={}), reports)
+    # The artefacts of the small run go to a sibling directory ...
+    assert Path(artefacts["results_csv"]).parent != reports
+    assert Path(artefacts["results_csv"]).parent.name == "reports_small"
+    # ... and the original report is untouched.
+    assert (reports / "results.md").read_text(encoding="utf-8") == big_md
+    assert (reports / "results.csv").read_text(encoding="utf-8") == big_csv
+
+
+def test_build_report_overwrites_a_report_of_the_same_size(tmp_path) -> None:
+    """Chạy lại đúng lượt cũ thì ghi đè bình thường (idempotent)."""
+    from hgrag.eval.report import build_report
+
+    reports = tmp_path / "reports"
+    build_report(EvalRun(rows=_report_rows(40), meta={}), reports)
+    artefacts = build_report(EvalRun(rows=_report_rows(40), meta={}), reports)
+    assert Path(artefacts["results_csv"]).parent == reports
+    assert "Tổng số lượt chấm: **40**" in (
+        reports / "results.md"
+    ).read_text(encoding="utf-8")
+
+
+def test_build_report_writes_in_place_when_no_bigger_report_exists(tmp_path) -> None:
+    """Không có báo cáo trước thì báo cáo mới được ghi đúng chỗ."""
+    from hgrag.eval.report import build_report
+
+    reports = tmp_path / "reports"
+    artefacts = build_report(EvalRun(rows=_report_rows(3), meta={}), reports)
+    assert Path(artefacts["results_csv"]).parent == reports
+    assert (reports / "results.csv").exists()
+    assert (reports / "results.md").exists()
+    assert (reports / "error_analysis.md").exists()
+    assert (reports / "figures").is_dir()

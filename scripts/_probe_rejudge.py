@@ -16,12 +16,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from hgrag.eval.judge import _is_self_consistent  # noqa: E402
 
 
 def main() -> int:
     total = 0
-    rescuable = 0
     for path in sorted(glob.glob(str(REPO_ROOT / "artifacts/eval_ckpt_*.json"))):
         data = json.loads(Path(path).read_text())
         rows = data.get("rows", [])

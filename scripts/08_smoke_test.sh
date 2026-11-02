@@ -113,7 +113,9 @@ step "QA pipeline (mock, offline)" "$PY" scripts/06_ask.py \
     "Trần Hưng Đạo đánh bại quân Mông Cổ vào năm nào?" --mock --json
 
 step "đánh giá mini (mock, 3 câu)" "$PY" scripts/07_run_eval.py \
-    --mock --limit 3 --no-ablations --reports /tmp/hgrag_smoke_reports
+    --mock --limit 3 --no-ablations \
+    --out /tmp/hgrag_smoke_eval_run.json \
+    --reports /tmp/hgrag_smoke_reports
 
 echo ""
 echo "=============================================="

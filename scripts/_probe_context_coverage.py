@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         texts = [str(getattr(e, "text", "") or "") for e in evidence]
         kinds = [str(getattr(e, "kind", "") or "") for e in evidence]
         joined = " ".join(texts).lower()
-        graph_text = " ".join(t for t, k in zip(texts, kinds) if k == "graph_path").lower()
+        graph_text = " ".join(t for t, k in zip(texts, kinds, strict=False) if k == "graph_path").lower()
         gold = (q.answer or "").strip().lower()
         seen: dict[str, int] = {}
         for t in texts:
