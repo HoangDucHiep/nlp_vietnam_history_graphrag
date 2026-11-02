@@ -63,6 +63,23 @@ Hãy trả lời theo quy tắc ở trên.
 {plan}"""
 
 
+#: Prompt của baseline **B0 (closed-book)**: không có CONTEXT, mô hình phải
+#: trả lời bằng kiến thức tham số của chính nó.  Đây là baseline bắt buộc
+#: theo docs/04 §4.1 (B0 = LLM-only, "chỉ kiến thức mô hình").
+CLOSED_BOOK_SYSTEM_PROMPT = """Bạn là chuyên gia lịch sử Việt Nam. Bạn trả lời câu hỏi dựa trên KIẾN THỨC CỦA CHÍNH BẠN (closed-book), không có tài liệu tham chiếu nào được cung cấp.
+
+Quy tắc bắt buộc:
+1. Trả lời trực tiếp, súc tích, bằng tiếng Việt, đúng mốc thời gian và địa danh.
+2. KHÔNG gắn trích dẫn [E#] vì không có nguồn nào được cung cấp.
+3. Nếu bạn không chắc chắn về câu trả lời, hãy nói rõ rằng bạn không chắc chắn thay vì bịa đặt chi tiết.
+4. Kết thúc bằng một mục "## Suy luận" gồm các bước suy luận đánh số (1., 2., 3.) ngắn gọn.
+"""
+
+CLOSED_BOOK_USER_TEMPLATE = """CÂU HỎI: {question}
+
+Hãy trả lời theo quy tắc ở trên."""
+
+
 @dataclass
 class AnswerResult:
     """The generated answer and its metadata."""
@@ -211,6 +228,65 @@ class AnswerGenerator:
             used_evidence_ids=valid,
             invalid_citations=invalid,
             refused=refused,
+            reasoning_chain=chain,
+            raw_response=raw,
+        )
+
+    # ------------------------------------------------------------------
+    def generate_closed_book(self, question: str) -> AnswerResult:
+        """Answer ``question`` from the model's own knowledge (baseline B0).
+
+        Không có CONTEXT và không có evidence: mô hình phải trả lời bằng kiến
+        thức tham số.  Vì không có nguồn, đáp án không mang trích dẫn ``[E#]``
+        và không thể bị chấm "grounded" -- chấm điểm groundedness chỉ áp dụng
+        cho các hệ thống có truy xuất (xem ``grounded_applicable``).
+        """
+        if self.llm_client is None:
+            return AnswerResult(
+                answer=(
+                    "Tôi không tìm thấy đủ thông tin trong kho kiến thức để trả lời "
+                    "câu hỏi này."
+                ),
+                refused=True,
+            )
+
+        from ..llm.schemas import LLMMessage, LLMRequest
+
+        request = LLMRequest(
+            messages=[
+                LLMMessage(role="system", content=CLOSED_BOOK_SYSTEM_PROMPT),
+                LLMMessage(
+                    role="user",
+                    content=CLOSED_BOOK_USER_TEMPLATE.format(question=question.strip()),
+                ),
+            ],
+            task="answer_closed_book",
+            temperature=0.0,
+        )
+        raw = ""
+        try:
+            raw = self.llm_client.generate(request).text
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Sinh câu trả lời closed-book thất bại: %s", exc)
+            raw = ""
+
+        if not raw.strip():
+            return AnswerResult(
+                answer=(
+                    "Tôi không tìm thấy đủ thông tin trong kho kiến thức để trả lời "
+                    "câu hỏi này."
+                ),
+                refused=True,
+            )
+
+        answer_text = self._strip_reasoning(raw)
+        chain = parse_reasoning_chain(raw) or parse_reasoning_chain(answer_text)
+        return AnswerResult(
+            answer=answer_text.strip(),
+            citations=[],
+            used_evidence_ids=[],
+            invalid_citations=[],
+            refused=is_refusal(answer_text),
             reasoning_chain=chain,
             raw_response=raw,
         )

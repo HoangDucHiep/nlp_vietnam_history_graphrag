@@ -84,6 +84,25 @@ CONTEXT (evidence được trích dẫn):
 Hãy chấm điểm theo rubric trên.
 """
 
+#: Rubric cho baseline **B0 (closed-book)**: không có CONTEXT nên không thể
+#: chấm "grounded" (không có nguồn để đối chiếu).  Chỉ chấm độ đúng so với
+#: đáp án tham chiếu / gold facts.  Cột groundedness của B0 sẽ được báo cáo
+#: là "–" (không áp dụng).
+CLOSED_BOOK_JUDGE_TEMPLATE = """CÂU HỎI:
+{question}
+
+ĐÁP ÁN THAM CHIẾU:
+{reference}
+
+GOLD FACTS:
+{gold_facts}
+
+ĐÁP ÁN ỨNG VIÊN (trả lời closed-book, KHÔNG có tài liệu tham chiếu):
+{answer}
+
+Hãy chấm điểm theo rubric trên (chỉ chấm độ đúng; đặt grounded = true).
+"""
+
 #: Marker of a question that lies **outside** the knowledge base.  Such a
 #: question has no reference answer; it is graded by *behaviour* instead:
 #: the correct behaviour is to refuse, the wrong behaviour is to answer
@@ -184,17 +203,22 @@ class LLMJudge:
         gold_facts: Sequence[str] | None = None,
         evidence: Sequence[Any] | None = None,
         out_of_kb: bool = False,
+        closed_book: bool = False,
     ) -> JudgeResult:
         """Grade ``answer``.
 
         ``out_of_kb`` switches to the *behaviour* rubric: the correct
         answer is a refusal, and any attempt to answer the question is
         scored as a hallucination (docs/04 §2.1, nguồn D).
+
+        ``closed_book`` marks the B0 baseline: there is no context to check
+        the answer against, so only the correctness is graded.
         """
         if out_of_kb:
             return _grade_out_of_kb(answer)
         context = _render_evidence(evidence)
-        prompt = JUDGE_TEMPLATE.format(
+        template = CLOSED_BOOK_JUDGE_TEMPLATE if closed_book else JUDGE_TEMPLATE
+        prompt = template.format(
             question=question,
             reference=reference or "(không có đáp án tham chiếu)",
             gold_facts="\n".join(f"- {f}" for f in (gold_facts or [])) or "(không có)",
@@ -210,8 +234,12 @@ class LLMJudge:
                 gold_facts=gold_facts,
                 evidence=evidence,
                 out_of_kb=out_of_kb,
+                closed_book=closed_book,
             )
-        return _result_from_payload(payload)
+        result = _result_from_payload(payload)
+        if closed_book:
+            result.grounded = True
+        return result
 
     # ------------------------------------------------------------------
     def _ask(self, prompt: str) -> dict[str, Any] | None:
@@ -248,6 +276,7 @@ class HeuristicJudge:
         gold_facts: Sequence[str] | None = None,
         evidence: Sequence[Any] | None = None,
         out_of_kb: bool = False,
+        closed_book: bool = False,
     ) -> JudgeResult:
         if out_of_kb:
             return _grade_out_of_kb(answer)
@@ -260,6 +289,8 @@ class HeuristicJudge:
         evidence_ids = [str(_evidence_id(e)) for e in (evidence or [])]
         supported = [m for m in markers if m in evidence_ids]
         grounded = bool(supported) or not markers
+        if closed_book:
+            grounded = True
         return JudgeResult(
             score=score,
             correct=score >= 2,

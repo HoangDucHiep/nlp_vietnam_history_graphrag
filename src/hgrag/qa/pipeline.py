@@ -539,10 +539,10 @@ class QAPipeline:
     # baselines (used by the evaluation harness)
     # ------------------------------------------------------------------
     def answer_llm_only(self, question: str, system: str = "B0") -> QAResult:
-        """B0 baseline: the LLM answers without any retrieval."""
+        """B0 baseline: the LLM answers from its own knowledge, without retrieval."""
         started = time.perf_counter()
         generator = AnswerGenerator(self.llm_client, self.settings)
-        answer = generator.generate(question, "", evidence=[], understanding=None)
+        answer = generator.generate_closed_book(question)
         result = QAResult(
             question=question,
             answer=answer.answer,

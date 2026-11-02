@@ -27,6 +27,8 @@ flowchart TB
   subgraph kg["hgrag.kg"]
     ON[ontology.py]
     AL[alias.py<br/>bảng alias QID-first]
+    LB[labels.py<br/>tên sự kiện dùng chung]
+    VG[vhe_gold.py<br/>import chú giải VHE]
     B[builder.py]
     ST[store.py<br/>Neo4j | SQLite]
   end
@@ -173,15 +175,16 @@ vietnam_history_graphrag/
 │   ├── config.py
 │   ├── llm/       client.py prompts.py schemas.py
 │   ├── data/      vhe.py wikipedia.py history_chat.py chunking.py normalize.py
-│   ├── kg/        ontology.py builder.py resolver.py store.py graph_store.py
+│   ├── kg/        ontology.py labels.py builder.py alias.py store.py vhe_gold.py
 │   ├── retrieval/ embeddings.py vector_store.py entity_linker.py
-│   │              graph_search.py fusion.py context.py
+│   │              graph_search.py fusion.py context.py lexical.py rerank.py
 │   ├── qa/        query_understanding.py pipeline.py answer.py explain.py
-│   ├── eval/      dataset_builder.py metrics.py judge.py run_eval.py report.py
+│   ├── eval/      dataset_builder.py dataset.py metrics.py judge.py run_eval.py report.py
 │   └── app/       streamlit_app.py
 ├── scripts/       00_up.sh 00_down.sh 01_ingest.py 03_build_kg.py 04_embed.py
 │                  05_eval_dataset.py 06_ask.py 07_run_eval.py 08_smoke_test.sh
-│                  09_live_check.py run_all.sh
+│                  09_live_check.py 10_validate_eval_paths.py 11_fix_eval_paths.py
+│                  run_all.sh
 ├── notebooks/kaggle/ 01_embed_corpus.ipynb 02_finetune_embedder.ipynb
 ├── data/raw  data/processed  artifacts/  reports/
 └── tests/
@@ -203,10 +206,15 @@ Tất cả đọc cấu hình từ `configs/default.yaml` + biến môi trườn
 ```
 00_up.sh                      # bật Neo4j + Qdrant, chờ healthy
 01_ingest.py                  # VHE + Wikipedia + HistoryChat → corpus.jsonl (cached)
-03_build_kg.py                # Gemini trích xuất event theo ontology VHE + entity resolution
+03_build_kg.py --vhe          # Gemini trích xuất event theo ontology VHE + entity resolution
                               #   + nạp Neo4j (kèm provenance SUPPORTED_BY → :Chunk)
-04_embed.py                   # nhúng chunk → Qdrant collection `chunks`
+                              #   + import chú giải VHE thành đồ thị con riêng
+04_embed.py                   # nhúng chunk → Qdrant `chunks_local`
+04_embed.py --corpus data/processed/vhe_corpus.jsonl
+                              #   → nhúng câu VHE → Qdrant `chunks_vhe_local`
 05_eval_dataset.py            # sinh bộ câu hỏi đánh giá (4 nguồn) → eval_questions.jsonl
+10_validate_eval_paths.py     # đo bao nhiêu node của gold path có thật trong KG
+11_fix_eval_paths.py          # chuẩn hoá gold path theo KG (nếu cần)
 06_ask.py                     # CLI hỏi đáp: câu trả lời + [E#] + chuỗi suy luận + subgraph
 07_run_eval.py                # chạy B0/B1/B2/Ours + A1–A7 → reports/results.{csv,md} + figures/
 08_smoke_test.sh              # kiểm tra offline toàn hệ thống (imports, pytest, services)
@@ -231,13 +239,52 @@ Mỗi bước **idempotent**, có cache, chạy lại được, seed cố địn
 
 | Hạng mục | Kết quả thực tế |
 |---|---|
-| Corpus | **438 chunk** từ Wikipedia tiếng Việt (59 bài seed) + VHE + History Chat |
-| Knowledge Graph | **714 node · 1 405 edge** (120 chunk đã trích xuất bằng Gemini thật), 293 event, 5 loại quan hệ |
-| Provenance | 793 edge `SUPPORTED_BY` → `:Chunk` (mọi node truy vết được nguồn) |
-| Vector store | Qdrant collection `chunks`, 768 chiều (`gemini-embedding-001`) |
-| Bộ câu hỏi | **150 câu**: 60 single-hop · 45 multi-hop · 23 temporal · 22 out-of-KB |
+| Corpus | **438 chunk** từ Wikipedia tiếng Việt (59 bài seed) + **4 110 câu VHE** + History Chat |
+| Knowledge Graph | **18 634 node · 36 214 edge** (Wikipedia trích xuất bằng Gemini thật + **VHE gold**: 12 089 entity, 30 997 relation) |
+| Provenance | Mọi edge `SUPPORTED_BY` → `:Chunk` (mọi node truy vết được nguồn) |
+| Vector store | Qdrant `chunks_local` (438 chunk, 384 chiều, MiniLM đa ngôn ngữ) + `chunks_vhe_local` (4 110 câu VHE, 384 chiều) |
+| Bộ câu hỏi | **150 câu**: 88 VHE template · 30 LLM-from-Wikipedia · 10 history chat · 22 out-of-KB |
+| Gold path | **97,7%** node của gold path có thật trong đồ thị (`scripts/10_validate_eval_paths.py`) |
 | Test | `pytest` 100% pass (offline, không gọi mạng) |
 | Báo cáo | `reports/results.md`, `reports/results.csv`, `reports/figures/*.png` |
+
+### 9.1 Hai đồ thị con (subgraph)
+
+Đồ thị gồm hai đồ thị con **không trộn lẫn**, phân biệt bằng thuộc tính `source`:
+
+| Subgraph | Nguồn | Nội dung | Vì sao tách riêng |
+|---|---|---|---|
+| VHE gold | `vhe` | 12 089 entity + 30 997 relation + 4 110 chunk | Chỉ có ở bộ chú giải VHE; **88/150 câu hỏi đánh giá** dựng từ đây |
+| Wikipedia/LLM | `wikipedia`, `llm` | 2 435 entity + 5 217 relation + 438 chunk | Trích xuất bằng Gemini từ văn bản Wikipedia |
+
+Lý do tách: đồ thị Wikipedia là *suy luận* của LLM (sai sót có), đồ thị VHE là
+*chú giải vàng* của bộ dữ liệu (đúng hơn) và có câu Vệt cổ — trộn lẫn sẽ làm
+mất cả tính truy vết và chất lượng. Chi tiết: [`06_quyet_dinh_thiet_ke.md`](06_quyet_dinh_thiet_ke.md).
+
+### 9.2 Hướng của các edge
+
+Mọi edge có hướng cố định (`hgrag.kg.ontology.edge_is_participant_to_event`):
+
+- **người tham gia → sự kiện**: `PARTICIPATED_IN`, `AGENT_OF`, `INVOLVES`, `CAUSE_OF`, `PRECONDITION_OF`
+- **sự kiện → đối tượng ngữ cảnh**: `ABOUT`, `LOCATED_IN`, `OCCURRED_IN`, `OCCURRED_AT`, `HAPPENED_AT`
+
+Nhờ vậy một BFS bắt đầu từ một thực thể được nêu trong câu hỏi ("Đế Minh")
+đi tới được node sự kiện ("Đế Minh sinh ra Đế Nghi") rồi tới các đối tượng
+ngữ cảnh — đúng với hướng mà gold path của bộ đánh giá viết.
+
+### 9.3 Tên node của sự kiện
+
+Node sự kiện được đặt tên theo **đúng công thức** dùng chung bởi cả KG và bộ
+đánh giá (`hgrag.kg.labels.event_label`):
+
+```
+"<chủ thể> <động từ> <đối tượng>"     ví dụ: "Đế Minh sinh ra Đế Nghi"
+```
+
+Hai nơi dùng chung một bảng ánh xạ (`EVENT_TYPE_VN`, `ROLE_VN`) là điều kiện
+để metric `path_hit_rate` đo được điều gì: nếu KG gọi sự kiện là
+"Đế Minh sinh Đế Nghi" còn gold path ghi "Đế Minh sinh ra Đế Nghi", hệ thống
+bị trừ điểm cho một sự kiện nó đã truy xuất hoàn hảo.
 
 Các con số trên được tái lập bằng `bash scripts/run_all.sh` và kiểm chứng lại bằng
 `bash scripts/08_smoke_test.sh` + `python scripts/09_live_check.py`.

@@ -85,6 +85,10 @@ class EvalRow:
     #: corresponding metric instead of being counted as a miss.
     path_applicable: bool = False
     chunk_applicable: bool = False
+    #: Whether the *groundedness* of this row is measurable.  The B0
+    #: baseline answers closed-book: there is no context to check the claims
+    #: against, so the groundedness of B0 is reported as "–" (n/a).
+    grounded_applicable: bool = True
     linked_entities: list[str] = field(default_factory=list)
     retrieved_paths: list[list[str]] = field(default_factory=list)
     retrieved_chunks: list[str] = field(default_factory=list)
@@ -118,6 +122,7 @@ class EvalRow:
             "n_citations": self.n_citations,
             "path_applicable": self.path_applicable,
             "chunk_applicable": self.chunk_applicable,
+            "grounded_applicable": self.grounded_applicable,
             "linked_entities": list(self.linked_entities),
             "retrieved_paths": list(self.retrieved_paths),
             "retrieved_chunks": list(self.retrieved_chunks),
@@ -201,6 +206,7 @@ def _score_row(
         gold_facts=list(question.gold_relations),
         evidence=evidence,
         out_of_kb=is_out_of_kb(question),
+        closed_book=(system == "B0"),
     )
 
     markers = M.extract_citation_markers(answer)
@@ -240,6 +246,7 @@ def _score_row(
         n_citations=len(markers),
         path_applicable=bool(question.gold_paths),
         chunk_applicable=bool(question.gold_chunk_ids),
+        grounded_applicable=(system != "B0"),
         linked_entities=linked_entities,
         retrieved_paths=retrieved_paths,
         retrieved_chunks=retrieved_chunks,
@@ -431,7 +438,8 @@ def summarize_system(run: EvalRun, system: str) -> dict[str, Any]:
         "system": system,
         "n": len(rows),
         "accuracy": sum(1.0 if r.judge_correct else 0.0 for r in rows) / len(rows),
-        "groundedness": sum(1.0 if r.grounded else 0.0 for r in rows) / len(rows),
+        "groundedness": _mean_applicable(rows, "grounded", "grounded_applicable"),
+        "groundedness_applicable": any(r.grounded_applicable for r in rows),
         "refusal_rate": sum(1.0 if r.refused else 0.0 for r in rows) / len(rows),
         "no_citation_rate": M.no_citation_rate([r.answer for r in rows]),
         "latency_p50": M.percentile([r.elapsed for r in rows], 50),
@@ -456,7 +464,8 @@ def summarize_system(run: EvalRun, system: str) -> dict[str, Any]:
         by_type[qtype] = {
             "n": len(subset),
             "accuracy": sum(1.0 if r.judge_correct else 0.0 for r in subset) / len(subset),
-            "groundedness": sum(1.0 if r.grounded else 0.0 for r in subset) / len(subset),
+            "groundedness": _mean_applicable(subset, "grounded", "grounded_applicable"),
+            "groundedness_applicable": any(r.grounded_applicable for r in subset),
             "token_f1": sum(r.token_f1 for r in subset) / len(subset),
             "path_hit": _mean_applicable(subset, "path_hit", "path_applicable"),
         }

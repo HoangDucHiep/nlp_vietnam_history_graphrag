@@ -67,9 +67,15 @@ def _rows_for(run: EvalRun) -> list[dict[str, Any]]:
                     "n": stats.get("n", 0),
                     "accuracy": round(float(stats.get("accuracy", 0.0)), 6),
                     "judge_score": "",
-                    "groundedness": round(float(stats.get("groundedness", 0.0)), 6),
-                    "hallucination_rate": round(
-                        1.0 - float(stats.get("groundedness", 0.0)), 6
+                    "groundedness": (
+                        round(float(stats.get("groundedness", 0.0)), 6)
+                        if stats.get("groundedness_applicable", True)
+                        else ""
+                    ),
+                    "hallucination_rate": (
+                        round(1.0 - float(stats.get("groundedness", 0.0)), 6)
+                        if stats.get("groundedness_applicable", True)
+                        else ""
                     ),
                     "token_f1": round(float(stats.get("token_f1", 0.0)), 6),
                     "rouge_l": "",
@@ -90,14 +96,18 @@ def _rows_for(run: EvalRun) -> list[dict[str, Any]]:
 
 
 def _summary_row(system: str, group: str, summary: dict[str, Any]) -> dict[str, Any]:
+    grounded_applicable = bool(summary.get("groundedness_applicable", True))
+    grounded = round(float(summary.get("groundedness", 0.0)), 6) if grounded_applicable else ""
     return {
         "system": system,
         "group": group,
         "n": summary.get("n", 0),
         "accuracy": round(float(summary.get("accuracy", 0.0)), 6),
         "judge_score": round(float(summary.get("judge_score", 0.0)), 6),
-        "groundedness": round(float(summary.get("groundedness", 0.0)), 6),
-        "hallucination_rate": round(1.0 - float(summary.get("groundedness", 0.0)), 6),
+        "groundedness": grounded,
+        "hallucination_rate": round(1.0 - float(summary.get("groundedness", 0.0)), 6)
+        if grounded_applicable
+        else "",
         "token_f1": round(float(summary.get("token_f1", 0.0)), 6),
         "rouge_l": round(float(summary.get("rouge_l", 0.0)), 6),
         "citation_precision": round(float(summary.get("citation_precision", 0.0)), 6),
@@ -141,6 +151,18 @@ def _fmt(value: Any, digits: int = 3) -> str:
         return str(value)
 
 
+def _groundedness(summary: dict[str, Any]) -> Any:
+    """The groundedness of a summary, or ``None`` when it is not applicable.
+
+    The B0 baseline answers closed-book: there is no context to check the
+    claims against, so its groundedness must be reported as "–" instead of
+    a misleading ``0.000``.
+    """
+    if not summary.get("groundedness_applicable", True):
+        return None
+    return summary.get("groundedness")
+
+
 def _main_table(run: EvalRun) -> str:
     summaries = {s["system"]: s for s in summarize_run(run)}
     groups = sorted(
@@ -165,7 +187,7 @@ def _main_table(run: EvalRun) -> str:
                 name=_SYSTEM_LABELS.get(system, system),
                 n=s.get("n", 0),
                 acc=_fmt(s.get("accuracy")),
-                gr=_fmt(s.get("groundedness")),
+                gr=_fmt(_groundedness(s)),
                 f1=_fmt(s.get("token_f1")),
                 cp=_fmt(s.get("citation_precision")),
                 cr=_fmt(s.get("citation_recall")),
@@ -205,7 +227,7 @@ def _ablation_table(run: EvalRun) -> str:
         lines.append(
             "| Ours (đầy đủ) | {acc} | 0 | {gr} | {f1} | {ph} |".format(
                 acc=_fmt(base.get("accuracy")),
-                gr=_fmt(base.get("groundedness")),
+                gr=_fmt(_groundedness(base)),
                 f1=_fmt(base.get("token_f1")),
                 ph=_fmt(base.get("path_hit")),
             )
@@ -222,7 +244,7 @@ def _ablation_table(run: EvalRun) -> str:
                 label=_ABLATION_LABELS.get(name, name),
                 acc=_fmt(s.get("accuracy")),
                 delta=delta,
-                gr=_fmt(s.get("groundedness")),
+                gr=_fmt(_groundedness(s)),
                 f1=_fmt(s.get("token_f1")),
                 ph=_fmt(s.get("path_hit")),
             )
@@ -344,7 +366,12 @@ def make_figures(run: EvalRun, out_dir: str | Path) -> list[Path]:
     # -- 2. groundedness vs hallucination --------------------------------
     if systems:
         fig, ax = plt.subplots(figsize=(7, 4))
-        grounded = [float(summaries[s].get("groundedness", 0.0)) for s in systems]
+        grounded = [
+            float(summaries[s].get("groundedness", 0.0))
+            if summaries[s].get("groundedness_applicable", True)
+            else float("nan")
+            for s in systems
+        ]
         halluc = [1.0 - g for g in grounded]
         positions = range(len(systems))
         ax.bar([p - 0.2 for p in positions], grounded, width=0.4, label="Groundedness")
