@@ -876,6 +876,15 @@ class AliasResolver:
                 messages=[LLMMessage(role="user", content=prompt)],
                 task="verify_alias",
                 temperature=0.0,
+                response_schema={
+                    "type": "object",
+                    "properties": {
+                        "same": {"type": "boolean"},
+                        "reason": {"type": "string"},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": ["same"],
+                },
             )
             payload = client.generate_json(request)
         except Exception as exc:  # noqa: BLE001
@@ -978,6 +987,18 @@ class AliasResolver:
                 messages=[LLMMessage(role="user", content=prompt)],
                 task="entity_link_select",
                 temperature=0.0,
+                # A response schema makes the model return the JSON object
+                # directly instead of a fenced code block that the parser
+                # would have to strip.
+                response_schema={
+                    "type": "object",
+                    "properties": {
+                        "uid": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["uid", "confidence"],
+                },
             )
             payload = client.generate_json(request)
         except Exception as exc:  # noqa: BLE001

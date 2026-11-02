@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -301,6 +302,7 @@ def run_evaluation(
     skip_existing: bool = True,
     checkpoint_path: str | Path | None = None,
     checkpoint_every: int = 5,
+    concurrency: int = 1,
 ) -> EvalRun:
     """Run every system over the dataset and score the answers.
 
@@ -309,6 +311,12 @@ def run_evaluation(
     disk, and a re-run with the same path skips the (system, qid) pairs
     that are already present.  This matters a lot on free-tier LLM APIs
     where a long run can die on a 429 half-way through.
+
+    ``concurrency`` answers several questions at the same time.  The LLM
+    calls of a question are independent from the calls of another one, so the
+    concurrency only shortens the wall-clock time; the *content* of the rows
+    is not affected.  The quota is enforced by the shared rate limiter of the
+    client, so a high concurrency does not trigger any 429.
     """
     questions = list(dataset.questions if isinstance(dataset, EvalDataset) else dataset)
     if limit:
@@ -334,29 +342,55 @@ def run_evaluation(
     total = len(questions) * len(plan)
     done = 0
     degraded = 0
+
+    def _one(system: str, ablation: dict[str, bool], question: EvalQuestion) -> EvalRow | None:
+        try:
+            result = _answer_system(pipeline, question.question, system, ablation)
+        except Exception as exc:  # noqa: BLE001 - one failure must not stop the run
+            logger.warning("Câu %s (%s) lỗi: %s", question.qid, system, exc)
+            return None
+        try:
+            return _score_row(question, system, result, judge)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Chấm câu %s (%s) lỗi: %s", question.qid, system, exc)
+            return None
+
     for system, ablation in plan:
-        for question in questions:
-            done += 1
-            key = (system, question.qid)
-            if key in done_keys:
-                continue
-            if progress and done % 10 == 0:
-                logger.info("[eval] %d/%d (%s)", done, total, system)
-            try:
-                result = _answer_system(pipeline, question.question, system, ablation)
-            except Exception as exc:  # noqa: BLE001 - one failure must not stop the run
-                logger.warning("Câu %s (%s) lỗi: %s", question.qid, system, exc)
-                continue
-            try:
-                row = _score_row(question, system, result, judge)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Chấm câu %s (%s) lỗi: %s", question.qid, system, exc)
-                continue
-            if row.judge_degraded:
-                degraded += 1
-            run.rows.append(row)
-            if checkpoint_path and len(run.rows) % max(1, checkpoint_every) == 0:
-                _save_checkpoint(checkpoint_path, run)
+        pending = [q for q in questions if (system, q.qid) not in done_keys]
+        if not pending:
+            continue
+        if concurrency <= 1:
+            for question in pending:
+                done += 1
+                if progress and done % 10 == 0:
+                    logger.info("[eval] %d/%d (%s)", done, total, system)
+                row = _one(system, ablation, question)
+                if row is None:
+                    continue
+                if row.judge_degraded:
+                    degraded += 1
+                run.rows.append(row)
+                if checkpoint_path and len(run.rows) % max(1, checkpoint_every) == 0:
+                    _save_checkpoint(checkpoint_path, run)
+        else:
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                futures = {
+                    pool.submit(_one, system, ablation, question): question
+                    for question in pending
+                }
+                for future in as_completed(futures):
+                    done += 1
+                    question = futures[future]
+                    if progress and done % 10 == 0:
+                        logger.info("[eval] %d/%d (%s)", done, total, system)
+                    row = future.result()
+                    if row is None:
+                        continue
+                    if row.judge_degraded:
+                        degraded += 1
+                    run.rows.append(row)
+                    if checkpoint_path and len(run.rows) % max(1, checkpoint_every) == 0:
+                        _save_checkpoint(checkpoint_path, run)
     if checkpoint_path:
         _save_checkpoint(checkpoint_path, run)
     if degraded:

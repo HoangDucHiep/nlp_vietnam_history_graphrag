@@ -68,6 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-resume", action="store_true", help="bỏ qua checkpoint cũ")
     p.add_argument("--reports", type=str, default="reports", help="thư mục output của report")
     p.add_argument("--bootstrap", type=int, default=10_000, help="số lần lặp bootstrap")
+    p.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="số câu hỏi xử lý song song (hạn mức req/phút do client quản lý)",
+    )
     p.add_argument("--seed", type=int, default=42, help="random seed")
     p.add_argument("--verbose", action="store_true", help="bật log DEBUG")
     return p
@@ -125,6 +131,7 @@ def main(argv: list[str] | None = None) -> int:
         skip_existing=not args.no_resume,
         checkpoint_path=checkpoint,
         checkpoint_every=args.checkpoint_every,
+        concurrency=args.concurrency,
     )
     if not run.rows:
         print(json.dumps({"error": "Không có dòng kết quả nào"}, ensure_ascii=False))
