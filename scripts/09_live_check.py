@@ -35,7 +35,7 @@ from hgrag.kg.alias import AliasResolver  # noqa: E402
 from hgrag.kg.store import Neo4jGraphStore  # noqa: E402
 from hgrag.llm.client import build_llm_client  # noqa: E402
 from hgrag.llm.schemas import LLMMessage, LLMRequest  # noqa: E402
-from hgrag.qa.pipeline import QAPipeline  # noqa: E402
+from hgrag.qa.pipeline import QAPipeline, build_pipeline  # noqa: E402
 from hgrag.retrieval.embeddings import build_embedder  # noqa: E402
 from hgrag.retrieval.entity_linker import EntityLinker  # noqa: E402
 from hgrag.retrieval.graph_search import GraphSearcher  # noqa: E402
@@ -138,59 +138,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args.skip_eval:
 
         def _qa_check() -> dict[str, Any]:
-            embedder = build_embedder(settings, llm_client)
-            cfg = settings.neo4j
-            store = Neo4jGraphStore(
-                uri=settings.neo4j_uri,
-                user=str(cfg.get("user", "neo4j")),
-                password=settings.neo4j_password,
-                database=str(cfg.get("database", "neo4j")),
-            )
-            qcfg = settings.qdrant
-            vector_store = QdrantVectorStore(
-                url=str(qcfg.get("url", "http://localhost:6333")),
-                vector_size=int(qcfg.get("vector_size", 768)),
-            )
-            linker = EntityLinker(
-                resolver=AliasResolver(
-                    store=store,
-                    llm_client=llm_client,
-                    embedder=embedder,
-                    settings=settings,
-                ),
-                settings=settings,
-            )
-            pipeline = QAPipeline(
-                llm_client=llm_client,
-                embedder=embedder,
-                graph_store=store,
-                vector_store=vector_store,
-                entity_linker=linker,
-                graph_searcher=GraphSearcher(store=store, settings=settings, embedder=embedder),
-                reranker=build_reranker(settings, embedder),
-                settings=settings,
-            )
-            # The chunk collection must match the dimension of the *active*
-            # embedder: the Gemini vectors are 768-dim, the local
-            # sentence-transformers model is 384-dim.  Searching the wrong
-            # collection fails with "Wrong input: Vector dimension error" and
-            # the pipeline silently falls back to zero evidence.
-            is_local = str(getattr(embedder, "name", "")).startswith("local:")
-            collection = str(
-                qcfg.get("collection_chunks_local", "chunks_local")
-                if is_local
-                else qcfg.get("collection_chunks", "chunks")
-            )
-            vhe_collection = str(
-                qcfg.get(
-                    "collection_chunks_vhe_local" if is_local else "collection_chunks_vhe",
-                    "chunks_vhe_local" if is_local else "chunks_vhe",
-                )
-            )
-            collections = [collection]
-            if vhe_collection != collection:
-                collections.append(vhe_collection)
-            pipeline.set_chunk_collections(collections)
+            # Dùng **cùng** factory với bộ đánh giá và với ứng dụng Streamlit
+            # (``hgrag.qa.pipeline.build_pipeline``).  Bản dựng thủ công trước
+            # đây bỏ sót *alias index* và *lexical index* -> entity linking không
+            # tìm được node nào (n_linked = 0) và câu hỏi bị từ chối dù kho có
+            # đáp án.
+            pipeline = build_pipeline(settings, mock=False)
             result = pipeline.ask(args.question)
             return {
                 "question": result.question,
@@ -199,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
                 "refused": result.refused,
                 "n_evidence": len(result.evidence),
                 "n_linked": len(result.explanation.get("linked_entities") or []),
-                "collections": collections,
+                "collections": list(pipeline.chunk_collections),
                 "elapsed": round(result.elapsed, 2),
             }
 

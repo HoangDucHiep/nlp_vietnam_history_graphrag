@@ -147,9 +147,35 @@ python scripts/07_run_eval.py --limit 20      # chạy nhanh
 python scripts/07_run_eval.py --mock --limit 5   # offline
 ```
 
+### Kết quả lượt chạy cuối (150 câu × 11 hệ thống = 1 650 lượt chấm)
+
+LLM judge: `gemma-4-26b-a4b-it`; embedder: `local:paraphrase-multilingual-MiniLM-L12-v2`;
+**0/1 650** lượt chấm rơi về heuristic.
+
+| Hệ thống | Overall acc | Groundedness | Path hit | Cite-P | single-hop | multi-hop | temporal | out-of-KB |
+|---|---|---|---|---|---|---|---|---|
+| B0 LLM-only (closed-book) | 0.240 | – (n/a) | 0.000 | 0.000 | 0.233 | 0.133 | 0.087 | 0.636 |
+| B1 Vanilla RAG | 0.213 | 0.900 | 0.000 | 0.080 | 0.133 | 0.044 | 0.000 | 1.000 |
+| B2 RAG + Graph (no rerank) | 0.267 | 0.707 | 0.488 | 0.158 | 0.083 | 0.178 | 0.217 | 1.000 |
+| **Ours (Hybrid GraphRAG)** | **0.600** | 0.853 | 0.488 | 0.511 | **0.567** | **0.511** | **0.478** | **1.000** |
+
+Kiểm định (bootstrap paired 10 000 lần + McNemar): Ours thắng **mọi** baseline,
+Δ accuracy CI 95% lần lượt là `+0.360 [+0.267, +0.460]`, `+0.387 [+0.307, +0.473]`,
+`+0.333 [+0.253, +0.413]`, McNemar `p < 0.0001`.
+
+Ablation (Δ = Ours − ablation, âm = ablation kém hơn): bỏ **graph traversal**
+`−0.293`, bỏ **fusion** `−0.300`, bỏ **entity linking** `−0.280`, bỏ **entity
+resolution** `−0.247`, bỏ **rerank** `−0.047`, bỏ **temporal boost** `−0.013`,
+bỏ **context budget** `+0.007`.
+
+Nguyên nhân lỗi lớn nhất của Ours là **tầng truy xuất** chứ không phải tầng sinh:
+trong 37 câu bị từ chối, chỉ **29,7%** có đáp án vàng nằm trong CONTEXT
+(`scripts/_probe_refusal_coverage.py`).
+
 Kết quả: [`reports/results.md`](reports/results.md) ·
 [`reports/results.csv`](reports/results.csv) ·
-[`reports/error_analysis.md`](reports/error_analysis.md).
+[`reports/error_analysis.md`](reports/error_analysis.md) ·
+[`reports/figures/`](reports/figures/).
 
 ## 7. Kiểm thử
 
