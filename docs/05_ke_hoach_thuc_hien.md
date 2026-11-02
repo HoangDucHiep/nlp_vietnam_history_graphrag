@@ -194,7 +194,7 @@ kiểm soát" của từng bước.
 | KG edge | ≥ 15.000 | **36.214 edge** | 5.217 quan hệ (Wikipedia/LLM) + 30.997 quan hệ (VHE gold) + cạnh `[:SUPPORTED_BY]` nối entity/event → `:Chunk` |
 | Vector store | khớp số chunk | `chunks` 438 pt (768 chiều) · `chunks_local` 438 pt (384) · `chunks_vhe_local` 4.110 pt (384) | Embedding Gemini đã cạn quota → dùng model **cục bộ** `paraphrase-multilingual-MiniLM-L12-v2` (384 chiều) |
 | Bộ câu hỏi | ≥ 150 câu verified | **150 câu** (60 single-hop, 45 multi-hop, 23 temporal, 22 out-of-KB) | 88 từ VHE template, 30 từ Wikipedia, 10 History-Chat, 22 out-of-KB. Gold path đã được chuẩn hoá lại theo KG thật: **97,7% exact match** (98,67% substring) |
-| Test | 100% | **310 test pass**, `ruff check` sạch | `pytest -q` |
+| Test | 100% | **360 test pass** (2 skip), `ruff check` sạch | `pytest -q` |
 | Smoke test | script chạy được | `scripts/08_smoke_test.sh` xanh | Kiểm tra import / test / dịch vụ / corpus / mock ask / mock eval |
 | Live check | dịch vụ thật | `scripts/09_live_check.py` xanh | Gemini + Neo4j + Qdrant + QA end-to-end có citation hợp lệ |
 
@@ -236,6 +236,21 @@ kiểm soát" của từng bước.
    trên nhóm câu hỏi có gold tương ứng (`path_applicable` / `chunk_applicable`).
    Tương tự, groundedness của **B0 (closed-book)** là *không áp dụng* vì không
    có context để đối chiếu → báo cáo hiển thị "–".
+8. **Gemma 4 ăn hết ngân sách output bằng kênh suy luận** — Gemma tính token
+   của kênh suy luận vào `max_output_tokens`; khi kênh đó không kết thúc thì
+   API trả `finish_reason=MAX_TOKENS` với **body rỗng**.  Đây là nguyên nhân
+   98/150 câu B0 rỗng và độ trễ 45–90 s/câu.  Cách sửa: dùng `response_schema`
+   (API **tắt** kênh suy luận) + bộ phát hiện lặp `is_degenerate()`.
+   Chi tiết: `docs/10_quota_gemini_free_tier.md` §2 và `docs/03` §7.
+9. **Traversal đồ thị phải đi ngược qua event hub** — câu hỏi neo vào *theme*
+   ("Ai là người thành lập Văn Lang?") không rời được theme nếu chỉ đi chiều
+   xuôi, vì cạnh `ABOUT` nối `theme ← event ← agent`.  `_event_hub_rows()` đảo
+   chiều các cạnh hub → `path_hit` của nhóm VHE tăng từ **0/6** lên **5/8**
+   (`scripts/validate_fixes.py`).
+10. **Hai backend KG phải thống nhất về hướng cạnh** — `neighbors()` trả về
+    cạnh *tiếp giáp* node nhưng `src`/`dst` luôn mô tả **đúng hướng thật** của
+    quan hệ.  `InMemoryGraphStore` cũ hoán đổi `src`/`dst` khi `uid == dst`
+    (`src == dst`, mất quan hệ đi vào) → sửa để khớp `Neo4jGraphStore`.
 
 ## 6. Điều kiện tiên quyết & rủi ro lịch
 

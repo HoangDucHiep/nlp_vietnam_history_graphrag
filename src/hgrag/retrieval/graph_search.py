@@ -463,7 +463,6 @@ class GraphSearcher:
         out: list[dict[str, Any]] = []
         for row in raw_rows:
             src = row.get("src") or {}
-            dst = row.get("dst") or {}
             if str(src.get("uid") or "") != uid:
                 continue
             out.append(row)
