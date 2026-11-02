@@ -27,9 +27,9 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from hgrag.config import get_settings  # noqa: E402
-from hgrag.data.records import Chunk  # noqa: E402
+from hgrag.data.records import Chunk, Entity  # noqa: E402
 from hgrag.kg.alias import AliasResolver  # noqa: E402
-from hgrag.kg.builder import KGBuilder  # noqa: E402
+from hgrag.kg.builder import BuildStats, KGBuilder  # noqa: E402
 from hgrag.kg.extractor import EventExtractor  # noqa: E402
 from hgrag.kg.ontology import ONTOLOGY  # noqa: E402
 from hgrag.kg.store import InMemoryGraphStore, Neo4jGraphStore  # noqa: E402
@@ -86,6 +86,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="bật tra cứu trực tiếp Wikipedia/Wikidata cho mỗi mention (rất chậm)",
     )
+    p.add_argument(
+        "--vhe",
+        action="store_true",
+        default=True,
+        help="import VHE gold annotations vào KG (mặc định)",
+    )
+    p.add_argument(
+        "--no-vhe",
+        dest="vhe",
+        action="store_false",
+        help="không import VHE gold annotations",
+    )
+    p.add_argument(
+        "--vhe-limit",
+        type=int,
+        default=None,
+        help="giới hạn số câu VHE gold được import",
+    )
+    p.add_argument(
+        "--vhe-corpus",
+        type=str,
+        default="data/processed/vhe_corpus.jsonl",
+        help="nơi ghi corpus VHE để embedding (rỗng = không ghi)",
+    )
+    p.add_argument(
+        "--vhe-only",
+        action="store_true",
+        help="chỉ import VHE gold (giữ nguyên đồ thị Wikipedia đã có)",
+    )
     p.add_argument("--verbose", action="store_true", help="bật log DEBUG")
     return p
 
@@ -132,6 +161,74 @@ def reset_store(store: Any) -> None:
         store.entities.clear()
         store.relations.clear()
         logger.info("Đã xoá sạch dữ liệu cũ trong InMemoryGraphStore")
+
+
+def _import_vhe_gold(
+    store: Any,
+    ontology: Any,
+    settings: Any,
+    args: Any,
+) -> dict[str, Any]:
+    """Import the VHE gold annotations into the graph as their own subgraph."""
+    from hgrag.data import vhe
+    from hgrag.kg.vhe_gold import import_vhe_gold
+
+    instances = vhe.load_instances(
+        limit=args.vhe_limit,
+        cache_dir=settings.data_raw / "vhe",
+        offline=not args.live,
+    )
+    if not instances:
+        logger.warning("VHE gold không tải được -> bỏ qua")
+        return {"n_instances": 0}
+    entities, relations, chunks = import_vhe_gold(instances, ontology)
+
+    # The chunk nodes are stored as ``:Entity`` with ``entity_type="Chunk"``
+    # (same convention as the Wikipedia subgraph) because the provenance
+    # edges ``SUPPORTED_BY`` point at them.
+    chunk_entities = [
+        Entity(
+            uid=chunk.chunk_id,
+            name=chunk.title or chunk.doc_id or chunk.chunk_id,
+            entity_type="Chunk",
+            description=(chunk.text or "")[:400],
+            source=chunk.source,
+            source_chunk_ids=[chunk.chunk_id],
+            extra={
+                "chunk_id": chunk.chunk_id,
+                "doc_id": chunk.doc_id,
+                "section": chunk.section,
+                "url": chunk.url,
+                "year_min": chunk.year_min,
+                "year_max": chunk.year_max,
+                "wikidata_id": chunk.wikidata_id,
+            },
+        )
+        for chunk in chunks
+    ]
+
+    store.upsert_entities(entities)
+    store.upsert_entities(chunk_entities)
+    store.upsert_relations(relations)
+
+    # The VHE sentences are written to their own corpus file so that the
+    # embedding step can index them separately (they are classical
+    # Vietnamese and must not pollute the Wikipedia vector space).
+    out_path = Path(args.vhe_corpus) if args.vhe_corpus else None
+    if out_path is not None:
+        if not out_path.is_absolute():
+            out_path = REPO_ROOT / out_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8") as fh:
+            for chunk in chunks:
+                fh.write(chunk.to_json() + "\n")
+    return {
+        "n_instances": len(instances),
+        "n_entities": len(entities),
+        "n_relations": len(relations),
+        "n_chunks": len(chunks),
+        "corpus": str(out_path) if out_path else "",
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -239,7 +336,20 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- build ----------------------------------------------------------
     chunks = list(read_corpus(corpus_path))
-    stats = builder.build_from_chunks(chunks, max_chunks=args.limit, progress=True)
+    if args.vhe_only:
+        logger.info("Chế độ --vhe-only: bỏ qua xây dựng đồ thị Wikipedia")
+        stats = BuildStats()
+    else:
+        stats = builder.build_from_chunks(chunks, max_chunks=args.limit, progress=True)
+
+    # -- VHE gold subgraph ------------------------------------------------
+    # ADR-01: VHE is the ontology + the gold of the evaluation set.  The
+    # template questions of docs/04 §2.1 (source A) ask about the VHE gold
+    # events, so the gold has to live in the graph as well -- otherwise 3/4
+    # of the evaluation set asks about entities the system never saw.
+    vhe_stats: dict[str, Any] = {}
+    if args.vhe:
+        vhe_stats = _import_vhe_gold(store, ontology, settings, args)
 
     payload: dict[str, Any] = {
         "corpus": str(corpus_path),
@@ -250,6 +360,7 @@ def main(argv: list[str] | None = None) -> int:
         "extract": bool(args.extract),
         "online_resolve": bool(args.online) and not args.offline,
         "live_resolve": bool(args.live) and not args.offline,
+        "vhe_only": bool(args.vhe_only),
         "ontology": {
             "source": ontology.source,
             "n_event_types": len(ontology.event_types),
@@ -259,6 +370,7 @@ def main(argv: list[str] | None = None) -> int:
         "store_stats": builder.export_stats().get("store", {}),
         "llm_calls": getattr(extractor, "n_llm_calls", 0),
         "cache_hits": getattr(extractor, "n_cache_hits", 0),
+        "vhe_gold": vhe_stats,
     }
 
     out_path = Path(args.out) if args.out else None

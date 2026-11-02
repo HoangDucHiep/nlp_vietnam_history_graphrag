@@ -28,8 +28,15 @@ from typing import Any
 from ..data.normalize import name_key
 from ..data.records import Chunk, Entity, Relation, stable_uid
 from .alias import AliasResolver
-from .ontology import ONTOLOGY as _DEFAULT_ONTOLOGY
-from .ontology import Ontology, normalize_role, relation_for_role
+from .ontology import (
+    ONTOLOGY as _DEFAULT_ONTOLOGY,
+)
+from .ontology import (
+    Ontology,
+    edge_is_participant_to_event,
+    normalize_role,
+    relation_for_role,
+)
 from .seed import anchor_relation, seed_entities_from_chunks
 
 logger = logging.getLogger(__name__)
@@ -255,7 +262,6 @@ class KGBuilder:
         # its Wikipedia redirect aliases) is seeded *before* the extraction
         # so that the resolver can link the extracted mentions to it.
         anchors = seed_entities_from_chunks(chunk_list, wikidata=self.wikidata)
-        anchor_by_uid = {a.uid: a for a in anchors}
         for anchor in anchors:
             entities.setdefault(anchor.uid, anchor)
         if self.resolver is not None and anchors:
@@ -420,11 +426,20 @@ class KGBuilder:
                 stats.n_linked += 1
 
             rel_type = relation_for_role(role, self.ontology.relation_types)
-            rel_uid = stable_uid(event_uid, rel_type, arg_entity.uid, prefix="rel_")
+            # Direction (docs/02 §3.2): a participant edge points *to* the
+            # event (``person -[:PARTICIPATED_IN]-> event``) so that a
+            # traversal starting at an entity anchor reaches the event, and
+            # a context edge points *from* the event
+            # (``event -[:LOCATED_IN]-> place``).
+            if edge_is_participant_to_event(rel_type):
+                src_uid, dst_uid = arg_entity.uid, event_uid
+            else:
+                src_uid, dst_uid = event_uid, arg_entity.uid
+            rel_uid = stable_uid(src_uid, rel_type, dst_uid, prefix="rel_")
             relation = Relation(
                 uid=rel_uid,
-                src=event_uid,
-                dst=arg_entity.uid,
+                src=src_uid,
+                dst=dst_uid,
                 rel_type=rel_type,
                 text=f"{event_type}: {trigger} --{role.lower()}--> {name}",
                 year=event.year,

@@ -102,8 +102,31 @@ class Neo4jGraphStore:
         self._driver.verify_connectivity()
         self.database = database
         logger.info("Đã kết nối Neo4j tại %s", uri)
+        self.ensure_schema()
 
     # -- internals -------------------------------------------------------
+    def ensure_schema(self) -> None:
+        """Create the constraints / indexes the KG needs.
+
+        Without a uniqueness constraint on ``:Entity.uid`` every
+        ``MATCH (a:Entity {uid: row.src})`` of the relation upsert is a
+        **label scan** over the whole graph.  With ~15 000 nodes and ~31 000
+        relations of the VHE gold subgraph that turns the import into a
+        multi-hour job; with the constraint it takes minutes.
+        """
+        statements = (
+            "CREATE CONSTRAINT entity_uid IF NOT EXISTS "
+            "FOR (e:Entity) REQUIRE e.uid IS UNIQUE",
+            "CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)",
+            "CREATE INDEX entity_name_key IF NOT EXISTS FOR (e:Entity) ON (e.name_key)",
+            "CREATE INDEX entity_qid IF NOT EXISTS FOR (e:Entity) ON (e.wikidata_id)",
+        )
+        for statement in statements:
+            try:
+                self._run(statement)
+            except Exception as exc:  # noqa: BLE001 - a missing index is not fatal
+                logger.warning("Không tạo được schema Neo4j (%s): %s", statement, exc)
+
     def _run(self, query: str, **params: Any) -> list[dict[str, Any]]:
         """Run a Cypher query and materialise all records inside the session.
 

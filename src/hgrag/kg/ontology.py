@@ -72,6 +72,9 @@ __all__ = [
     "normalize_role",
     "relation_for_role",
     "validate_event",
+    "edge_is_participant_to_event",
+    "PARTICIPANT_TO_EVENT_RELATIONS",
+    "EVENT_TO_ARGUMENT_RELATIONS",
 ]
 
 #: Repository root (used to locate the cached VHE copy under ``data/raw/vhe``).
@@ -122,6 +125,52 @@ RELATION_TYPES: dict[str, str] = {
 
 #: Fallback for roles that carry no explicit mapping.
 DEFAULT_RELATION = "ABOUT"
+
+#: Relation types whose edge points **from the participant to the event**
+#: (``person -[:PARTICIPATED_IN]-> event``).  The traversal of the evaluation
+#: set starts at a named entity (the question anchor) and has to reach the
+#: event first, then the context arguments of the event -- so the
+#: participant edge is oriented towards the event (docs/02 §3.2).
+PARTICIPANT_TO_EVENT_RELATIONS: frozenset[str] = frozenset(
+    {
+        "PARTICIPATED_IN",
+        "AGENT_OF",
+        "INVOLVES",
+        "CAUSE_OF",
+        "PRECONDITION_OF",
+    }
+)
+
+#: Relation types whose edge points **from the event to the argument**
+#: (``event -[:LOCATED_IN]-> place``).
+EVENT_TO_ARGUMENT_RELATIONS: frozenset[str] = frozenset(
+    {
+        "ABOUT",
+        "LOCATED_IN",
+        "OCCURRED_IN",
+        "OCCURRED_AT",
+        "HAPPENED_AT",
+    }
+)
+
+
+def edge_is_participant_to_event(rel_type: str) -> bool:
+    """Whether an argument edge is oriented ``participant -> event``.
+
+    >>> edge_is_participant_to_event("PARTICIPATED_IN")
+    True
+    >>> edge_is_participant_to_event("LOCATED_IN")
+    False
+    """
+    rel = str(rel_type or "").strip().upper()
+    if rel in PARTICIPANT_TO_EVENT_RELATIONS:
+        return True
+    if rel in EVENT_TO_ARGUMENT_RELATIONS:
+        return False
+    # Unknown relation type: fall back to the participant direction so that
+    # the entity anchor can still reach the event.
+    return True
+
 
 _ROLE_RE = re.compile(r"[^A-Z0-9]+")
 
