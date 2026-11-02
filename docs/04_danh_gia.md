@@ -216,6 +216,13 @@ Phân loại lỗi tự động (dựa trên log pipeline) + xác nhận tay tr�
 | **Sinh sai dù có evidence** | evidence đúng nhưng đáp án sai | Prompt không ràng buộc đủ, context quá dài |
 | **Judge sai** | người đánh giá và judge lệch nhau | Rubric chưa rõ, đáp án tham chiếu chưa sắc |
 | **Câu hỏi ngoài KG** | hệ thống bịa | Thiếu cơ chế từ chối |
+| **Câu hỏi lỗi** | judge nói rõ "câu hỏi sai lệch lịch sử" / "ngoài phạm vi kho" | Bộ câu hỏi sinh tự động có câu không hợp lệ (vd. ghép sự kiện đầu thế kỷ XX vào bối cảnh triều Trần) — **không phải lỗi của hệ thống**, được tách riêng để không trừ điểm oan |
+
+> Bảy loại trên được **phân loại tự động** trong `src/hgrag/eval/error_analysis.py`.
+> Phân loại dùng ba tín hiệu: *hành vi* của hệ thống (từ chối / trả lời / trích dẫn),
+> *chỉ số truy xuất* của dòng (evidence, entity recall, path hit) và **lý do của
+> judge** — vì judge đôi khi quy trách nhiệm cho *câu hỏi* chứ không phải cho
+> hệ thống (loại **"Câu hỏi lỗi"**).
 
 Kết quả phân tích lỗi là phần **quan trọng nhất** của báo cáo: cho thấy điểm mạnh/yếu và hướng cải thiện.
 
