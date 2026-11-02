@@ -53,15 +53,18 @@ và vì sao.]
 
 | Nguồn | Số lượng | Ghi chú |
 |---|---|---|
-| Wikipedia tiếng Việt (seed 59 bài) | 438 chunk | nguồn chính, có provenance URL |
-| VHE (Vietnam Historical Events) | [...] event | nguồn gold cho ontology + câu hỏi template |
-| History Chat | [...] | câu hỏi "ngoài đời" |
-| Wikidata | [...] QID | định danh thực thể, alias, P31/P27 |
+| Wikipedia tiếng Việt (seed 59 bài) | **438 chunk** | nguồn chính, có provenance URL |
+| VHE (Vietnam Historical Events) | **4.110 câu chú giải** → 12.089 entity, 30.997 relation | nguồn gold cho ontology + câu hỏi template |
+| History Chat | **10 câu** trong bộ đánh giá | câu hỏi "ngoài đời" |
+| Wikidata | QID cho các entity khớp được | định danh thực thể, alias, P31/P27 |
 
-*(điền từ `artifacts/embed_stats.json`, `artifacts/kg_stats.json`, `artifacts/eval_stats.json`)*
+*(điền từ `artifacts/embed_stats*.json`, `artifacts/kg_stats.json`)*
 
-**Chia tập.** `[X]`% tài liệu giữ lại làm `eval-exclusive` (không nạp vào KG/vector
-store) → câu hỏi sinh từ đó buộc hệ thống phải suy luận.
+**Chia tập.** `15%` tài liệu giữ lại làm `eval-exclusive` (không nạp vào KG/vector
+store) → câu hỏi sinh từ đó buộc hệ thống phải suy luận từ quan hệ đã học ở tài liệu
+khác. Với nguồn VHE, cơ chế tương đương là **đồ thị con VHE gold**: câu hỏi được
+sinh từ *quan hệ* của VHE nhưng câu trả lời phải được hỗ trợ bằng *văn bản* VHE
+(câu chú giải) → đo được khả năng nối tri thức có cấu trúc với ngôn ngữ tự nhiên.
 
 ## 4. Kiến trúc hệ thống
 
@@ -79,14 +82,14 @@ Mô tả ngắn gọn 4 tầng (kèm sơ đồ từ `docs/02_kien_truc.md`):
 
 ### 4.2 Định danh thực thể QID-first (6 tầng)
 
-| Tầng | Nguồn | Ngưỡng |
+| Tầng | Nguồn | Điểm |
 |---|---|---|
-| T0 | Wikidata QID đã biết | tuyệt đối |
-| T1 | Wikidata alias vi (`skos:altLabel[vi]`) | khớp `name_key` |
-| T2 | Wikipedia `prop=redirects` (lọc kinship) | 0.9 |
-| T3 | LLM xác minh alias | 0.85 |
-| T4 | Chuẩn hóa chuỗi | 0.8 |
-| T5 | Embedding top-k + lọc miền (P31/P27/thời gian) | 0.75 |
+| T0 | QID đã biết / node đã có trong KG | 1.00 |
+| T1 | Wikidata alias vi (`skos:altLabel[vi]`, `wbsearchentities`) | 0.97 |
+| T2 | Wikipedia `prop=redirects` | 0.93 |
+| T3 | LLM xác minh redirect | 0.90 |
+| T4 | Chuẩn hóa chuỗi (bỏ dấu, bỏ honorific, NFC) | 0.85 |
+| T5 | Embedding top-k + lọc miền (P31/P27/thời gian) + LLM phân giải | 0.60–0.90 |
 
 *(chi tiết: `docs/07_xac_dinh_thuc_the.md`)*
 
@@ -103,12 +106,13 @@ ngân sách 6 000 token.
 
 ## 5. Thiết lập thực nghiệm
 
-* **Mô hình**: `gemini-3.5-flash` (xoay `gemini-3.1-flash-lite`, `gemini-flash-lite-latest`, `gemini-3.8-flash` khi hết quota).
-* **Embedding**: `gemini-embedding-001` (768 chiều).
+* **Mô hình sinh**: `gemini-flash-lite-latest` (xoay sang `gemini-3.5-flash`, `gemini-3.8-flash`, `gemini-3.1-flash-lite` khi hết quota).
+* **Embedding**: quota Gemini đã cạn → dùng model **cục bộ** `paraphrase-multilingual-MiniLM-L12-v2` (384 chiều) cho cả corpus VHE và corpus Wikipedia (`chunks_local`, `chunks_vhe_local`).
+* **Rerank**: `bge-reranker-v2-m3` quá chậm trên CPU (~35 s/lần gọi) → `rerank_backend: auto` tự chuyển sang `HeuristicReranker` (BM25 + boost thời gian + cosine). *Đây là hạn chế của môi trường đánh giá và được nêu rõ trong phần phân tích.*
 * **Kho**: Neo4j 5.26 + Qdrant 1.12.4.
 * **Cố định**: cùng LLM, cùng prompt, cùng corpus cho mọi hệ thống → khác biệt do kiến trúc.
 * **Bộ câu hỏi**: 150 câu / 4 nhóm (chi tiết `docs/04_danh_gia.md`).
-* **Judge**: Gemini, rubric 0–2 + grounded + supported evidence ids.
+* **Judge**: Gemini, rubric 0–2 + grounded + supported evidence ids; câu out-of-KB chấm theo **hành vi** (từ chối = đúng).
 * **Tái lập**: `bash scripts/run_all.sh` (seed cố định `42`).
 
 ## 6. Kết quả
