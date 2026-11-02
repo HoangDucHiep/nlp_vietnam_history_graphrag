@@ -34,6 +34,7 @@ __all__ = [
     "FusionResult",
     "apply_diversity_cap",
     "apply_temporal_boost",
+    "dedupe_by_text",
     "fuse",
     "reciprocal_rank_fusion",
 ]
@@ -66,6 +67,33 @@ def _doc_id_of(item: Mapping[str, Any]) -> str:
         if item.get(key):
             return str(item[key])
     return ""
+
+
+def _diversity_key(item: Mapping[str, Any]) -> str:
+    """The bucket an item is counted against by the diversity cap.
+
+    A graph path has no ``doc_id``: it is not a passage of a document but a
+    chain of KG edges.  Counting *all* graph paths against the same bucket
+    (``"__nodoc__"``) would let the first few paths evict every later one --
+    with ``max_per_doc=3`` only three graph paths ever reached the context,
+    no matter how many the traversal had found.  Each path therefore counts
+    against its own bucket, keyed by its chain of nodes.
+    """
+    payload = item.get("payload") or {}
+    if isinstance(payload, Mapping) and payload.get("kind") == "graph_path":
+        path = payload.get("path") or {}
+        nodes = path.get("nodes") if isinstance(path, Mapping) else None
+        if nodes:
+            return "graph:" + "|".join(
+                str(n.get("uid") or n.get("name") or "") for n in nodes
+            )
+        return f"graph:{item.get('id') or ''}"
+    return _doc_id_of(item) or "__nodoc__"
+
+
+def _normalise_text(text: str) -> str:
+    """A comparison key for two pieces of context text."""
+    return re.sub(r"\s+", " ", str(text or "")).strip().lower()
 
 
 def _text_of(item: Mapping[str, Any]) -> str:
@@ -203,16 +231,45 @@ def apply_temporal_boost(
     return out
 
 
+def dedupe_by_text(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop items whose text is identical to an item already kept.
+
+    The traversal can reach the same chain of edges through several routes
+    (``Nhà Tần - ABOUT -> giải thể`` appeared twice for ``vhe_00013``), and
+    the KG stores one node per *mention*, so two chains can also render
+    identically while having different ids.  Repeating the same sentence in
+    the context only burns the token budget and makes the answer generator
+    believe the fact is stated twice.
+    """
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for item in items or []:
+        key = _normalise_text(_text_of(item))
+        if not key:
+            out.append(item)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
 def apply_diversity_cap(
     items: list[dict[str, Any]],
     max_per_doc: int = 3,
 ) -> list[dict[str, Any]]:
-    """Keep at most ``max_per_doc`` items per document."""
+    """Keep at most ``max_per_doc`` items per document.
+
+    Graph paths are counted against their *own* bucket (see
+    :func:`_diversity_key`), so the cap limits repeated passages without
+    evicting the graph paths.
+    """
     cap = max(1, int(max_per_doc))
     counts: dict[str, int] = {}
     out: list[dict[str, Any]] = []
     for item in items or []:
-        doc_id = _doc_id_of(item) or "__nodoc__"
+        doc_id = _diversity_key(item)
         if counts.get(doc_id, 0) >= cap:
             continue
         counts[doc_id] = counts.get(doc_id, 0) + 1
@@ -284,5 +341,6 @@ def fuse(
 
     fused = reciprocal_rank_fusion({"vector": vector_list, "graph": graph_list}, k=k)
     fused = apply_temporal_boost(fused, year_refs)
+    fused = dedupe_by_text(fused)
     fused = apply_diversity_cap(fused, max_per_doc=max_per_doc)
     return FusionResult(items=fused)

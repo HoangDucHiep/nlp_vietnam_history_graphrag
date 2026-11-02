@@ -151,6 +151,21 @@ def _fmt(value: Any, digits: int = 3) -> str:
         return str(value)
 
 
+def _fmt_signed(value: Any, digits: int = 3) -> str:
+    """Format a *difference* with an explicit sign.
+
+    The ablation table shows ``Δ so với Ours``.  Without the sign a value
+    like ``0.080`` is ambiguous: it reads as "Ours tốt hơn 8 %" while it
+    actually means "ablation này **tốt hơn** Ours 8 %".
+    """
+    if value is None or value == "":
+        return "–"
+    try:
+        return f"{float(value):+.{digits}f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def _groundedness(summary: dict[str, Any]) -> Any:
     """The groundedness of a summary, or ``None`` when it is not applicable.
 
@@ -220,7 +235,7 @@ def _ablation_table(run: EvalRun) -> str:
     summaries = {s["system"]: s for s in summarize_run(run)}
     base = summaries.get("ours")
     lines = [
-        "| Cấu hình | Overall acc | Δ so với Ours | Groundedness | Token-F1 | Path hit |",
+        "| Cấu hình | Overall acc | Δ so với Ours (− = kém hơn) | Groundedness | Token-F1 | Path hit |",
         "|---|---|---|---|---|---|",
     ]
     if base:
@@ -238,7 +253,9 @@ def _ablation_table(run: EvalRun) -> str:
             continue
         delta = ""
         if base:
-            delta = _fmt(float(s.get("accuracy", 0.0)) - float(base.get("accuracy", 0.0)))
+            delta = _fmt_signed(
+                float(s.get("accuracy", 0.0)) - float(base.get("accuracy", 0.0))
+            )
         lines.append(
             "| {label} | {acc} | {delta} | {gr} | {f1} | {ph} |".format(
                 label=_ABLATION_LABELS.get(name, name),
@@ -253,20 +270,24 @@ def _ablation_table(run: EvalRun) -> str:
 
 
 def _stats_section(run: EvalRun) -> str:
-    lines = ["| So sánh | n | Acc baseline | Acc target | Δ (95% CI) | McNemar p |", "|---|---|---|---|---|---|"]
+    lines = [
+        "| So sánh | n | Acc baseline | Acc target | Δ = Ours − baseline (95% CI) | McNemar p |",
+        "|---|---|---|---|---|---|",
+    ]
     for baseline in ("B0", "B1", "B2"):
         comparison = compare_systems(run, baseline=baseline, target="ours")
         if not comparison.get("n_questions"):
             continue
         ci = comparison["accuracy_diff_ci"]
         lines.append(
-            "| Ours vs {base} | {n} | {b} | {t} | [{lo}, {hi}] | {p} |".format(
+            "| Ours vs {base} | {n} | {b} | {t} | {mean} [{lo}, {hi}] | {p} |".format(
                 base=baseline,
                 n=comparison["n_questions"],
                 b=_fmt(comparison["baseline_accuracy"]),
                 t=_fmt(comparison["target_accuracy"]),
-                lo=_fmt(ci["ci_low"]),
-                hi=_fmt(ci["ci_high"]),
+                mean=_fmt_signed(ci["mean"]),
+                lo=_fmt_signed(ci["ci_low"]),
+                hi=_fmt_signed(ci["ci_high"]),
                 p=_fmt(comparison["mcnemar"]["p_value"], 4),
             )
         )

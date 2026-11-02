@@ -676,11 +676,6 @@ def build_pipeline(settings: Any = None, mock: bool = False) -> QAPipeline:
     # The Gemini vectors are 768-dim; a local sentence-transformers model is
     # 384-dim.  Each embedder therefore uses its *own* collection so that the
     # query vector always has the same dimension as the stored corpus.
-    is_local = str(getattr(embedder, "name", "")).startswith("local:")
-    if is_local:
-        collection = str(qcfg.get("collection_chunks_local", "chunks_local"))
-    else:
-        collection = str(qcfg.get("collection_chunks", "chunks"))
     try:
         vector_store = QdrantVectorStore(
             url=str(qcfg.get("url", "http://localhost:6333")),
@@ -689,6 +684,18 @@ def build_pipeline(settings: Any = None, mock: bool = False) -> QAPipeline:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Không kết nối được Qdrant (%s) -> dùng NumpyVectorStore", exc)
         vector_store = NumpyVectorStore(vector_size=embed_dim)
+
+    # The corpus on disk decides which embedder may be used.  The Gemini
+    # embedding quota of the free tier is exhausted every few hours, and the
+    # client then silently switches to the local model -- but the Qdrant
+    # collections were still indexed with the *Gemini* vectors, so the query
+    # vector (384-dim) would not match the stored corpus (768-dim) and every
+    # VHE gold sentence would be lost.  Therefore the collection names are
+    # resolved against what actually exists in Qdrant, and the embedder is
+    # adapted to the dimension of that corpus.
+    embedder, embed_dim, collections = _resolve_corpus(
+        vector_store, qcfg, embedder, embed_dim, settings
+    )
 
     resolver = AliasResolver(
         store=store,
@@ -740,16 +747,133 @@ def build_pipeline(settings: Any = None, mock: bool = False) -> QAPipeline:
     )
     # The chunk corpus is split over several collections: the Wikipedia
     # chunks and the VHE gold sentences.  Both are searched and merged.
-    collections = [collection]
-    vhe_collection = str(
-        qcfg.get(
-            "collection_chunks_vhe_local" if is_local else "collection_chunks_vhe",
-            "chunks_vhe_local" if is_local else "chunks_vhe",
-        )
-    )
-    if vhe_collection != collection:
-        collections.append(vhe_collection)
     pipeline.set_chunk_collections(collections)
     return pipeline
+
+
+def _resolve_corpus(
+    vector_store: Any,
+    qcfg: Mapping[str, Any],
+    embedder: Any,
+    embed_dim: int,
+    settings: Any,
+) -> tuple[Any, int, list[str]]:
+    """Align the embedder with the corpus that is actually indexed.
+
+    The Qdrant collections carry the vectors of *one* embedder: the Gemini
+    ones are 768-dim, the local sentence-transformers ones are 384-dim.  The
+    embedder chosen at start-up may not match the corpus -- e.g. the Gemini
+    embedding quota is exhausted and the client falls back to the local model,
+    while the corpus is still indexed with Gemini vectors.  Searching a 384-dim
+    query against a 768-dim collection yields nothing, so the whole VHE gold
+    corpus would be silently lost.
+
+    The resolution order is therefore:
+
+    1. keep the current embedder when a collection of the same dimension
+       exists;
+    2. otherwise switch the embedder to the family that matches the corpus
+       (local <-> Gemini) and report the switch;
+    3. fall back to the configured names when Qdrant cannot be inspected.
+
+    Returns the (possibly replaced) embedder, its dimension and the list of
+    collections to search.
+    """
+    from ..retrieval.embeddings import LocalEmbedder, MockEmbedder
+
+    gemini_collections = [
+        str(qcfg.get("collection_chunks", "chunks")),
+        str(qcfg.get("collection_chunks_vhe", "chunks_vhe")),
+    ]
+    local_collections = [
+        str(qcfg.get("collection_chunks_local", "chunks_local")),
+        str(qcfg.get("collection_chunks_vhe_local", "chunks_vhe_local")),
+    ]
+
+    def _existing(names: list[str]) -> list[str]:
+        found: list[str] = []
+        for name in names:
+            try:
+                if vector_store.collection_exists(name):
+                    found.append(name)
+            except Exception:  # noqa: BLE001
+                return []
+        return found
+
+    def _dim_of(names: list[str]) -> int | None:
+        for name in names:
+            try:
+                dim = vector_store.collection_dim(name)
+            except Exception:  # noqa: BLE001
+                dim = None
+            if dim:
+                return int(dim)
+        return None
+
+    try:
+        local_found = _existing(local_collections)
+        gemini_found = _existing(gemini_collections)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không kiểm tra được collection Qdrant (%s)", exc)
+        local_found, gemini_found = [], []
+
+    if not local_found and not gemini_found:
+        # Không có sẵn corpus vector nào -> dùng tên cấu hình.
+        is_local = str(getattr(embedder, "name", "")).startswith("local:")
+        names = local_collections if is_local else gemini_collections
+        return embedder, embed_dim, list(names)
+
+    local_dim = _dim_of(local_found)
+    gemini_dim = _dim_of(gemini_found)
+    embedder_name = str(getattr(embedder, "name", "") or "")
+    is_mock = embedder_name == "mock"
+
+    # Ưu tiên nhóm collection có **cùng số chiều** với embedder hiện tại --
+    # đó là điều kiện cần và đủ để tìm kiếm vector được.
+    if embed_dim and local_dim == embed_dim:
+        chosen, chosen_dim = local_found, local_dim
+    elif embed_dim and gemini_dim == embed_dim:
+        chosen, chosen_dim = gemini_found, gemini_dim
+    elif is_mock:
+        # Embedder giả (offline/test): không đổi embedder, dùng nhóm 768 chiều.
+        chosen, chosen_dim = (
+            (gemini_found, gemini_dim) if gemini_found else (local_found, local_dim)
+        )
+    else:
+        # Không nhóm nào khớp -> chọn nhóm đông điểm hơn và đổi embedder cho
+        # khớp với nó (xem phần chuyển embedder bên dưới).
+        if local_found and (not gemini_found or (local_dim or 0) <= (gemini_dim or 0)):
+            chosen, chosen_dim = local_found, local_dim
+        else:
+            chosen, chosen_dim = gemini_found, gemini_dim
+
+    if chosen_dim and embed_dim and chosen_dim != embed_dim:
+        logger.warning(
+            "Corpus trong Qdrant dùng vector %d chiều nhưng embedder hiện tại là %r "
+            "-- chuyển sang embedder phù hợp",
+            chosen_dim,
+            embedder_name or "?",
+        )
+        if chosen_dim <= 512:
+            model_name = str(settings.embedding.get("local_model", "") or "")
+            try:
+                embedder = LocalEmbedder(model_name)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Không dùng được local embedder %r (%s)", model_name, exc)
+                embedder = MockEmbedder(dim=chosen_dim, seed=settings.seed)
+        else:
+            from ..llm.client import build_llm_client
+            from ..retrieval.embeddings import LLMEmbedder
+
+            embedder = LLMEmbedder(build_llm_client(settings))
+        embed_dim = int(getattr(embedder, "dim", chosen_dim) or chosen_dim)
+
+    logger.info(
+        "Vector search dùng %d collection: %s (dim=%d)",
+        len(chosen),
+        ", ".join(chosen),
+        embed_dim,
+    )
+    return embedder, embed_dim, list(chosen)
 
 

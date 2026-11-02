@@ -65,7 +65,14 @@ def main(argv: list[str] | None = None) -> int:
     by_qid = {q.qid: q for q in dataset}
 
     checkpoints = sorted((REPO_ROOT / "artifacts").glob("eval_ckpt_*.json"))
-    checkpoints = [p for p in checkpoints if "rejudged" not in p.name]
+    # Bản sao lưu trước khi chấm lại có tên ``*.pre_rejudge.json`` -- chúng
+    # **không** phải checkpoint của lượt chạy, nên phải loại khỏi danh sách
+    # (nếu không thì mỗi dòng hỏng sẽ được chấm lại hai lần).
+    checkpoints = [
+        p
+        for p in checkpoints
+        if "rejudged" not in p.name and not p.name.endswith(".pre_rejudge.json")
+    ]
 
     total_fixed = 0
     for path in checkpoints:

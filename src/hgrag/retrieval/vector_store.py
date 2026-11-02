@@ -28,6 +28,12 @@ class VectorStore(Protocol):
 
     def count(self, name: str) -> int: ...
 
+    def collection_exists(self, name: str) -> bool:
+        """Whether the collection is present in the store."""
+
+    def collection_dim(self, name: str) -> int | None:
+        """Vector dimension of the collection (``None`` when unknown)."""
+
     def close(self) -> None: ...
 
 
@@ -141,6 +147,31 @@ class QdrantVectorStore:
         except Exception:  # noqa: BLE001 - collection may not exist yet
             return 0
 
+    def collection_exists(self, name: str) -> bool:
+        try:
+            return bool(self.client.collection_exists(name))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def collection_dim(self, name: str) -> int | None:
+        """Vector dimension of an existing collection.
+
+        The dimension tells *which* embedder produced the stored vectors,
+        which is how the pipeline knows whether it may search the collection
+        with the current query vector.
+        """
+        try:
+            info = self.client.get_collection(name)
+        except Exception:  # noqa: BLE001
+            return None
+        params = getattr(info, "config", None)
+        vectors = getattr(params, "params", None)
+        vectors = getattr(vectors, "vectors", None)
+        size = getattr(vectors, "size", None)
+        if size is None and isinstance(vectors, dict):
+            size = vectors.get("size")
+        return int(size) if size else None
+
     def close(self) -> None:
         try:
             self.client.close()
@@ -209,6 +240,15 @@ class NumpyVectorStore:
 
     def count(self, name: str) -> int:
         return len(self._col(name)["ids"])
+
+    def collection_exists(self, name: str) -> bool:
+        return name in self.collections
+
+    def collection_dim(self, name: str) -> int | None:
+        col = self.collections.get(name)
+        if not col or not col["vectors"]:
+            return None
+        return len(col["vectors"][0])
 
     def close(self) -> None:  # pragma: no cover - trivial
         return None

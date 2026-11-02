@@ -216,8 +216,99 @@ Phân loại lỗi tự động (dựa trên log pipeline) + xác nhận tay tr�
 | **Sinh sai dù có evidence** | evidence đúng nhưng đáp án sai | Prompt không ràng buộc đủ, context quá dài |
 | **Judge sai** | người đánh giá và judge lệch nhau | Rubric chưa rõ, đáp án tham chiếu chưa sắc |
 | **Câu hỏi ngoài KG** | hệ thống bịa | Thiếu cơ chế từ chối |
+| **Từ chối vì truy xuất hụt** | hệ thống từ chối và **đáp án vàng không có trong CONTEXT** | Đồ thị / vector chưa dựng được đường tới đáp án vàng |
+| **Từ chối dù đã có evidence** | hệ thống từ chối **dù đáp án vàng đã nằm trong CONTEXT** | Lỗi *sinh*: prompt / mô hình từ chối oan |
+| **Câu hỏi lỗi** | judge nói rõ "câu hỏi sai lệch lịch sử" / "ngoài phạm vi kho" | Bộ câu hỏi sinh tự động có câu không hợp lệ (vd. ghép sự kiện đầu thế kỷ XX vào bối cảnh triều Trần) — **không phải lỗi của hệ thống**, được tách riêng để không trừ điểm oan |
+
+> Mười loại trên được **phân loại tự động** trong `src/hgrag/eval/error_analysis.py`.
+> Phân loại dùng ba tín hiệu: *hành vi* của hệ thống (từ chối / trả lời / trích dẫn),
+> *chỉ số truy xuất* của dòng (evidence, entity recall, path hit) và **lý do của
+> judge** — vì judge đôi khi quy trách nhiệm cho *câu hỏi* chứ không phải cho
+> hệ thống (loại **"Câu hỏi lỗi"**).
+>
+> Đặc biệt, hai loại **"Từ chối vì truy xuất hụt"** và **"Từ chối dù đã có
+> evidence"** được tách bằng cách kiểm tra đáp án vàng có nằm trong các đường đi
+> đã truy xuất hay không: đây là hai nguyên nhân gốc **khác nhau** và cần hai
+> hướng khắc phục khác nhau (cải thiện *đồ thị* so với cải thiện *prompt*).
 
 Kết quả phân tích lỗi là phần **quan trọng nhất** của báo cáo: cho thấy điểm mạnh/yếu và hướng cải thiện.
+
+## 5.5 Kết quả lượt chạy cuối cùng
+
+Lượt chạy đầy đủ: **150 câu × 11 hệ thống = 1 650 lượt chấm**, tất cả bằng
+LLM judge (`gemma-4-26b-a4b-it`), **0 dòng rơi về heuristic**.
+
+| Hệ thống | Overall acc | Groundedness | Path hit | Cite-P | p50 (s) |
+|---|---|---|---|---|---|
+| B0 LLM-only (closed-book) | 0.240 | – (n/a) | 0.000 | 0.000 | 0.01 |
+| B1 Vanilla RAG | 0.213 | 0.900 | 0.000 | 0.080 | 0.10 |
+| B2 RAG + Graph (no rerank) | 0.267 | 0.707 | 0.488 | 0.158 | 32.0 |
+| **Ours (Hybrid GraphRAG)** | **0.600** | 0.853 | 0.488 | 0.511 | 72.7 |
+
+Theo nhóm câu hỏi (accuracy):
+
+| Hệ thống | single-hop | multi-hop | temporal | out-of-KB |
+|---|---|---|---|---|
+| B0 LLM-only | 0.233 | 0.133 | 0.087 | 0.636 |
+| B1 Vanilla RAG | 0.133 | 0.044 | 0.000 | 1.000 |
+| B2 RAG + Graph | 0.083 | 0.178 | 0.217 | 1.000 |
+| **Ours** | **0.567** | **0.511** | **0.478** | **1.000** |
+
+Kiểm định thống kê (bootstrap paired 10 000 lần, McNemar):
+
+| So sánh | Δ accuracy (95% CI) | McNemar p |
+|---|---|---|
+| Ours vs B0 | +0.360 [+0.267, +0.460] | < 0.0001 |
+| Ours vs B1 | +0.387 [+0.307, +0.473] | < 0.0001 |
+| Ours vs B2 | +0.333 [+0.253, +0.413] | < 0.0001 |
+
+Ablation (Δ = Ours − ablation; âm = ablation kém hơn):
+
+| Cấu hình | Overall acc | Δ |
+|---|---|---|
+| Ours (đầy đủ) | 0.600 | 0 |
+| A1 bỏ entity linking | 0.320 | −0.280 |
+| A2 bỏ entity resolution | 0.353 | −0.247 |
+| A3 bỏ temporal boost/filter | 0.587 | −0.013 |
+| A4 bỏ graph traversal | 0.307 | −0.293 |
+| A5 bỏ rerank | 0.553 | −0.047 |
+| A6 bỏ context budget | 0.607 | +0.007 |
+| A7 bỏ fusion | 0.300 | −0.300 |
+
+**Cách đọc kết quả**
+
+1. **Đồ thị là thành phần quan trọng nhất**: bỏ graph traversal (A4) hoặc bỏ
+   fusion (A7) làm accuracy mất ~0.30 — gần bằng việc không có hệ thống
+   truy xuất nào.
+2. **Định danh thực thể cũng vô cùng quan trọng**: bỏ entity linking (A1) hoặc
+   bỏ entity resolution (A2) đều làm accuracy mất ~0.25–0.28.
+3. **Rerank có tác dụng nhưng nhỏ** (A5: −0.047) — reranker hiện tại là heuristic.
+4. **Temporal boost gần như không tác dụng** ở bộ câu hỏi hiện tại (A3: −0.013).
+5. **Context budget không còn là nút thắt** ở `context_max_tokens = 6000`
+   (A6: +0.007, tức bỏ nó *không* giảm accuracy) — đây là kết quả **trung thực**
+   cần nêu trong báo cáo, và gợi ý hướng tương lai là *tăng* ngân sách thay vì
+   siết.
+
+**Phân tích lỗi của Ours** (60/150 câu sai):
+
+| Loại lỗi | Số lỗi | Tỉ lệ |
+|---|---|---|
+| Từ chối vì truy xuất hụt | 36 | 60.0% |
+| Từ chối dù đã có evidence | 7 | 11.7% |
+| Entity linking sai | 5 | 8.3% |
+| Thiếu evidence | 4 | 6.7% |
+| Trích dẫn không hợp lệ | 4 | 6.7% |
+| Đường đi sai | 2 | 3.3% |
+| Sinh sai dù có evidence | 1 | 1.7% |
+| Câu hỏi lỗi (ngoài KB / sai lệch) | 1 | 1.7% |
+
+Nguyên nhân lớn nhất là **tầng truy xuất**, không phải tầng sinh: đo trực tiếp
+bằng `scripts/_probe_refusal_coverage.py` trên 37 câu bị từ chối, chỉ **29.7%**
+câu có đáp án vàng nằm trong CONTEXT — tức phần lớn các câu bị từ chối là vì
+đồ thị/vector **chưa** dựng được đường tới đáp án vàng, không phải vì mô hình
+"quá thận trọng".  Đây là hướng cải thiện số 1 cho phiên bản tiếp theo:
+nới `graph_max_hops`, cải thiện chấm điểm đường đi (A1/A2 cho thấy tầng định
+danh là nút thắt), và mở rộng quan hệ trong ontology.
 
 ## 6. Rủi ro của thiết kế đánh giá
 
