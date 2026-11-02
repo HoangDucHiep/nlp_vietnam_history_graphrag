@@ -269,7 +269,6 @@ def _run_config(pipeline: Any) -> dict[str, Any]:
     settings = getattr(pipeline, "settings", None)
     if settings is not None:
         config["llm_model"] = getattr(settings, "llm_model", "")
-        config["embed_model"] = getattr(settings, "embed_model", "")
         retrieval = dict(getattr(settings, "retrieval", {}) or {})
         config["rerank_backend"] = retrieval.get("rerank_backend", "")
         config["vector_top_k"] = retrieval.get("vector_top_k", "")
@@ -287,7 +286,8 @@ def _run_config(pipeline: Any) -> dict[str, Any]:
         config["collections"] = ", ".join(str(c) for c in collections)
     judge = getattr(pipeline, "llm_client", None)
     if judge is not None:
-        config["judge"] = "LLM judge (Gemini)"
+        model = str(getattr(judge, "model", "") or "")
+        config["judge"] = f"LLM judge ({model})" if model else "LLM judge"
     return {k: v for k, v in config.items() if v not in ("", None)}
 
 
