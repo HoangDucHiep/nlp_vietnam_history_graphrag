@@ -429,13 +429,16 @@ class QAPipeline:
         self, items: list[dict[str, Any]], paths: Sequence[Any]
     ) -> list[Evidence]:
         """Turn the fused items into :class:`Evidence` objects."""
-        path_by_text: dict[str, Any] = {}
-        for path in paths:
+        # The fused item carries the serialised path in its payload; the
+        # index of the path is used to attach the edge list to the evidence.
+        path_by_id: dict[str, Any] = {}
+        for index, path in enumerate(paths):
+            path_by_id[f"graph:{index}"] = path
             to_text = getattr(path, "to_text", None)
             if callable(to_text):
                 key = to_text()
                 if key:
-                    path_by_text[key] = path
+                    path_by_id[key] = path
 
         evidence: list[Evidence] = []
         for index, item in enumerate(items, start=1):
@@ -455,7 +458,7 @@ class QAPipeline:
                 url = url or str(holder.get("url") or "")
             if not text:
                 text = str(item.get("text") or "")
-            path = path_by_text.get(str(item.get("id") or ""))
+            path = path_by_id.get(str(item.get("id") or ""))
             path_payload = []
             if path is not None:
                 path_payload = [

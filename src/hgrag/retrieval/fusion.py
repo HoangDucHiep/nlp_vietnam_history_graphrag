@@ -259,11 +259,21 @@ def fuse(
             payload = dict(path.get("payload") or {})
         else:
             identifier = str(getattr(path, "path_id", "") or f"graph:{index}")
-            text = str(getattr(path, "to_text", lambda: "")() or "")
+            # The *readable* rendering is what goes into the prompt: the
+            # compact ``A -REL-> B`` chain is kept as ``path_text`` for the
+            # logs and for the path signature.  Without the readable form the
+            # answer generator treats a graph path as an opaque list of
+            # relation labels and refuses to answer (measured: 42 % of the
+            # VHE template questions).
+            natural = getattr(path, "to_natural_text", None)
+            text = str(natural() or "") if callable(natural) else ""
+            if not text:
+                text = str(getattr(path, "to_text", lambda: "")() or "")
             score = float(getattr(path, "score", 0.0) or 0.0)
             payload = {
                 "kind": "graph_path",
                 "text": text,
+                "path_text": str(getattr(path, "to_text", lambda: "")() or ""),
                 "hops": int(getattr(path, "hops", 0) or 0),
                 "source_chunk_ids": list(getattr(path, "source_chunk_ids", []) or []),
                 "path": getattr(path, "to_dict", lambda: {})(),

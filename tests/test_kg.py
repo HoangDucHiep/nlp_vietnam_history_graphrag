@@ -557,3 +557,70 @@ def test_builder_max_chunks(tmp_path: Path, sample_chunk: Chunk) -> None:
     chunks = [Chunk(**{**base, "chunk_id": f"ck_{i}"}) for i in range(5)]
     stats = builder.build_from_chunks(chunks, max_chunks=2, progress=False)
     assert stats.n_chunks == 2
+
+
+# --------------------------------------------------------------------------
+# VHE gold import -- the entity identity rule
+# --------------------------------------------------------------------------
+
+
+def test_vhe_entity_uid_ignores_entity_type() -> None:
+    """The same mention must map to a single node, whatever its role.
+
+    Regression test for the bug that made 42 % of the VHE template questions
+    be refused: the VHE entity uid used to contain the entity *type*, so
+    ``Sơn Tinh`` (the agent of ``Sơn Tinh gặp gỡ``) and ``Sơn Tinh`` (the
+    theme of ``Mị Nương cưới Sơn Tinh``) were two different nodes and the
+    traversal could not reach the gold event.
+    """
+    from hgrag.kg.vhe_gold import vhe_entity_uid
+
+    assert vhe_entity_uid("Sơn Tinh", "Person") == vhe_entity_uid("Sơn Tinh", "Entity")
+    assert vhe_entity_uid("Sơn Tinh", "Person") == vhe_entity_uid("sơn tinh", "Place")
+    assert vhe_entity_uid("Sơn Tinh") != vhe_entity_uid("Mị Nương")
+
+
+def test_import_vhe_gold_merges_the_roles_of_one_mention() -> None:
+    """One mention used with two roles yields a single node with two roles."""
+    from hgrag.kg.vhe_gold import import_vhe_gold
+
+    instances = [
+        {
+            "id": "dvsktt-s60",
+            "text": "Mị Nương đã lấy Sơn Tinh, Thục Vương tức giận.",
+            "events": [
+                {
+                    "type": "marry",
+                    "trigger_word": "lấy",
+                    "arguments": [
+                        {"role": "AGENT", "mention": "Mị Nương"},
+                        {"role": "THEME", "mention": "Sơn Tinh"},
+                    ],
+                },
+                {
+                    "type": "meet",
+                    "trigger_word": "gọi",
+                    "arguments": [
+                        {"role": "AGENT", "mention": "Sơn Tinh"},
+                        {"role": "THEME", "mention": "người man"},
+                    ],
+                },
+            ],
+        }
+    ]
+    entities, relations, _chunks = import_vhe_gold(instances, ONTOLOGY)
+
+    by_name = {e.name: e for e in entities if e.entity_type != "Event"}
+    assert "Sơn Tinh" in by_name
+    son_tinh = by_name["Sơn Tinh"]
+    assert set(son_tinh.extra.get("roles") or []) == {"THEME", "AGENT"}
+
+    # the relation of the *marry* event points at the canonical node
+    marry = [r for r in relations if r.rel_type == "ABOUT" and "marry" in (r.text or "")]
+    assert marry
+    assert marry[0].dst == son_tinh.uid
+
+    # ... and the relation of the *meet* event points at the very same node
+    meet = [r for r in relations if r.rel_type == "PARTICIPATED_IN" and "meet" in (r.text or "")]
+    assert meet
+    assert meet[0].src == son_tinh.uid

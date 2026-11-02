@@ -463,6 +463,61 @@ def test_graph_searcher_theme_path_direction(event_hub_graph: InMemoryGraphStore
             assert path.nodes[index + 1]["uid"] == edge["dst"]
 
 
+def test_graph_path_natural_text_quotes_the_evidence(
+    event_hub_graph: InMemoryGraphStore,
+) -> None:
+    """Đường đi phải đọc được, kèm câu nguồn của sự kiện.
+
+    Regression test: the ``A -REL-> B`` chain is opaque for the answer
+    generator, which then refuses to answer even though the gold answer is
+    inside the context (42 % of the VHE template questions were refused).
+    """
+    searcher = GraphSearcher(event_hub_graph)
+    result = searcher.search(
+        ["th:van_lang"], max_hops=3, max_paths=10, query_text="Ai thành lập Văn Lang?"
+    )
+    assert result.paths
+    natural = result.paths[0].to_natural_text()
+    assert "Văn Lang" in natural
+    assert "->" in natural
+    # the readable rendering is *not* the compact chain
+    assert natural != result.paths[0].to_text()
+
+
+def test_graph_path_edge_carries_the_evidence_sentence() -> None:
+    """Cạnh của path phải mang theo câu văn bản gốc của sự kiện."""
+    from hgrag.data.records import Relation
+    from hgrag.retrieval.graph_search import GraphPath
+
+    path = GraphPath(
+        nodes=[{"uid": "e1", "name": "Mị Nương cưới Sơn Tinh"}, {"uid": "e2", "name": "Sơn Tinh"}],
+        edges=[
+            {
+                "src": "e1",
+                "dst": "e2",
+                "rel_type": "ABOUT",
+                "text": "marry: lấy --theme--> Sơn Tinh",
+                "evidence_text": "Mị Nương đã lấy Sơn Tinh, Thục Vương tức giận.",
+            }
+        ],
+        hops=1,
+    )
+    natural = path.to_natural_text()
+    assert "Mị Nương đã lấy Sơn Tinh" in natural
+    assert "Mị Nương cưới Sơn Tinh" in natural
+
+    # the relation itself carries the evidence in ``extra``
+    rel = Relation(
+        uid="r1",
+        src="e1",
+        dst="e2",
+        rel_type="ABOUT",
+        text="marry: lấy --theme--> Sơn Tinh",
+        extra={"evidence_text": "Mị Nương đã lấy Sơn Tinh."},
+    )
+    assert rel.extra["evidence_text"]
+
+
 # --------------------------------------------------------------------------
 # fusion
 # --------------------------------------------------------------------------

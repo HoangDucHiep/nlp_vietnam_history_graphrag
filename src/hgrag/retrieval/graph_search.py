@@ -30,6 +30,7 @@ Path scoring follows ``docs/03`` §5.2::
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -144,6 +145,35 @@ def _extract_years(text: str) -> list[int]:
     return out
 
 
+def _evidence_text_of(rel_props: Mapping[str, Any]) -> str:
+    """The original sentence that supports a relation.
+
+    The VHE gold stores the sentence the event was extracted from in
+    ``extra.evidence_text``; the Wikipedia subgraph stores it the same way.
+    Neo4j cannot store a nested map, so the ``extra`` payload is persisted
+    as the JSON string ``extra_json`` -- both shapes are handled here.
+
+    The sentence is what makes a graph path *readable*: the relation label
+    alone (``-ABOUT->``) says nothing about who did what, while the sentence
+    ("Mị Nương đã lấy Sơn Tinh, ...") contains the answer verbatim.
+    """
+    extra = rel_props.get("extra")
+    if not isinstance(extra, Mapping):
+        raw = rel_props.get("extra_json")
+        if raw:
+            try:
+                extra = json.loads(raw) if isinstance(raw, str) else {}
+            except (json.JSONDecodeError, TypeError):
+                extra = {}
+        else:
+            extra = {}
+    if isinstance(extra, Mapping):
+        text = str(extra.get("evidence_text") or "").strip()
+        if text:
+            return text
+    return str(rel_props.get("evidence_text") or "").strip()
+
+
 def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     if not a or not b:
         return 0.0
@@ -185,6 +215,49 @@ class GraphPath:
             parts.append(f" -{rel}-> ")
             parts.append(name)
         return "".join(parts)
+
+    def to_natural_text(self) -> str:
+        """Render the path as **readable Vietnamese sentences**.
+
+        The ``A -REL-> B`` rendering of :meth:`to_text` is meant for the
+        logs and for the path signature, but it is *not* readable enough for
+        the answer generator: a path such as
+
+            ``Nam Hải -ABOUT-> Nhà Tần thành lập Nam Hải -ABOUT-> Tượng Quận``
+
+        does not tell the model that "Nhà Tần" is the answer -- the model
+        reads it as an opaque chain of relation labels and refuses
+        (measured: 42 % of the VHE template questions were refused even
+        though the gold answer was inside the context).
+
+        This rendering therefore spells out the chain **and** quotes the
+        sentence that supports each edge (the VHE gold stores the original
+        sentence in ``extra.evidence_text``).  The result reads like::
+
+            Nhà Tần thành lập Nam Hải - sự kiện liên quan: Nam Hải.
+            Nguồn: Nhà Tần phát những người trốn tránh, ... đặt các quận
+            Quế Lâm, Nam Hải và Tượng Quận.
+        """
+        if not self.nodes:
+            return ""
+        sentences: list[str] = []
+        quotes: list[str] = []
+        for index, edge in enumerate(self.edges):
+            src = self.nodes[index] if index < len(self.nodes) else {}
+            dst = self.nodes[index + 1] if index + 1 < len(self.nodes) else {}
+            src_name = str(src.get("name") or src.get("uid") or "")
+            dst_name = str(dst.get("name") or dst.get("uid") or "")
+            rel = str(edge.get("rel_type") or "")
+            sentences.append(f"{src_name} - {rel} -> {dst_name}")
+            quote = str(edge.get("evidence_text") or "").strip()
+            if quote and quote not in quotes:
+                quotes.append(quote)
+        if not sentences:
+            return self.to_text()
+        rendered = "; ".join(sentences)
+        if quotes:
+            rendered += "\nNguồn: " + " ".join(quotes)
+        return rendered
 
     @property
     def node_uids(self) -> list[str]:
@@ -537,6 +610,7 @@ class GraphSearcher:
                 "confidence": float(rel_props.get("confidence") or 0.0),
                 "source_chunk_ids": list(rel_props.get("source_chunk_ids") or []),
                 "year": rel_props.get("year"),
+                "evidence_text": _evidence_text_of(rel_props),
             }
             new_nodes = [*nodes, self._node_dict(other)]
             new_edges = [*edges, edge]

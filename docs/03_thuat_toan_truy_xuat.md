@@ -163,6 +163,77 @@ Cơ chế này được kiểm chứng bằng `scripts/validate_fixes.py`:
 
 Trước khi sửa: `path_hit = 0/6`; sau khi sửa: `path_hit = 5/8`.
 
+### 5.1.2 Định danh thực thể VHE: uid không chứa *loại* (bắt buộc)
+
+Cơ chế event hub chỉ chạy được nếu **anchor của câu hỏi và node trong sự kiện
+là cùng một node**. VHE gold thường nhắc cùng một thực thể với **hai vai trò
+khác nhau**:
+
+- `Sơn Tinh` là **agent** của sự kiện `Sơn Tinh gặp gỡ` (loại `Person`);
+- `Sơn Tinh` là **theme** của sự kiện `Mị Nương cưới Sơn Tinh` (loại `Entity`).
+
+Bản cũ sinh uid bằng `stable_uid(name_key(mention), entity_type)` — tức **loại
+thực thể nằm trong khoá** — nên hai mention hoá thành **hai node khác nhau**.
+Hậu quả đo được trên toàn bộ đồ thị VHE:
+
+| Chỉ số | Trước | Sau |
+|---|---|---|
+| Node VHE (không tính event/chunk) | 9 028 | **6 209** |
+| Tên có > 1 node | 1 056 | **0** |
+| Node bị tách đôi | 2 819 | **0** |
+| Quan hệ chạm node bị tách | 12 914 | — |
+
+Với đồ thị bị tách, câu "Ai là người cưới Sơn Tinh?" neo vào node `Person`,
+trong khi đáp án nằm sau node `Entity`: traversal **không chạm tới** sự kiện vàng
+→ context không có đáp án → mô hình từ chối trả lời. Đo trên 88 câu VHE
+template: **42 % bị từ chối**, và lỗi lớn nhất trong `error_analysis.md` là
+nhóm *"Từ chối nhầm câu trả lời được"* (74 %).
+
+Sau khi bỏ `entity_type` khỏi khoá uid (`vhe_entity_uid`), mọi mention trùng
+`tên` gộp làm một node; các loại quan sát được vẫn được lưu ở
+`extra.entity_types` để tầng truy xuất dùng làm gợi ý. Đo lại
+(`scripts/_probe_vhe_reach_offline.py`): **84/88 = 95,5 %** câu VHE template
+tới được node vàng của sự kiện (4 câu còn lại là lỗi **entity linking**:
+"Ngô" bị neo nhầm vào node Wikipedia thay vì "vua Ngô").
+
+> Test chốt lại quy tắc: `tests/test_kg.py::test_vhe_entity_uid_ignores_entity_type`
+> và `::test_import_vhe_gold_merges_the_roles_of_one_mention`.
+
+### 5.1.3 Đường đi phải **đọc được** (bắt buộc với bộ sinh câu trả lời)
+
+Sau khi traversal chạm tới sự kiện vàng, đường đi được đưa vào context dưới
+dạng chuỗi quan hệ:
+
+```
+Nam Hải -ABOUT-> Nhà Tần thành lập Nam Hải -ABOUT-> Tượng Quận -ABOUT-> gặp gỡ
+```
+
+Chuỗi này **quá mờ** với bộ sinh câu trả lời: nó đọc được như danh sách nhãn
+quan hệ, không cho biết *ai* làm *gì*, nên mô hình kết luận "không đủ thông
+tin" và từ chối — dù đáp án ("Nhà Tần") nằm ngay trong chuỗi. Đo lại: cả ba câu
+`vhe_00008` / `vhe_00012` / `vhe_00010` đều bị từ chối với lý do này.
+
+`GraphPath.to_natural_text()` (dùng bởi `fusion.fuse()` khi dựng evidence) vì
+vậy trình bày đường đi thành **câu có nghĩa**, kèm **câu nguồn** của mỗi cạnh
+(cảnh giác lấy từ `extra.evidence_text` của quan hệ — VHE gold lưu câu gốc
+của sự kiện ở đó):
+
+```
+Sơn Tinh - ABOUT -> Mị Nương cưới Sơn Tinh
+Nguồn: Mị Nương đã lấy Sơn Tinh, Thục Vương tức giận, dặn lại con cháu phải diệt Văn Lang mà chiếm lấy nước.
+```
+
+Sau khi sửa, cả ba câu trả lời đúng:
+
+| Câu hỏi | Trước | Sau |
+|---|---|---|
+| `vhe_00008` "Ai là người cưới Sơn Tinh?" | từ chối | "Mị Nương là người đã lấy Sơn Tinh [E4]" |
+| `vhe_00012` "Ai là người thành lập Nam Hải?" | từ chối | "Nhà Tần thành lập Nam Hải [E2], [E4], [E6]" |
+| `vhe_00010` "Ai là người tấn công Nam Chiếu?" | từ chối | "… Cao Vương [E4]" |
+
+> Test chốt lại quy tắc: `tests/test_retrieval.py::test_graph_path_natural_text_quotes_the_evidence`
+> và `::test_graph_path_edge_carries_the_evidence_sentence`.
+
 ### 5.2 Chấm điểm đường đi
 
 \[

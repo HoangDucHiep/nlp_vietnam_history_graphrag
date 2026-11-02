@@ -100,9 +100,32 @@ def vhe_event_uid(instance_id: str, index: int, event_type: str, trigger: str) -
     )
 
 
-def vhe_entity_uid(mention: str, entity_type: str) -> str:
-    """Stable uid of a VHE gold entity."""
-    return stable_uid(name_key(mention) or mention, entity_type, prefix="vhe_ent_")
+def vhe_entity_uid(mention: str, entity_type: str = "") -> str:
+    """Stable uid of a VHE gold entity.
+
+    The uid is derived from the **normalised mention only** -- the entity
+    type is deliberately *not* part of the key.
+
+    Why?  The VHE annotations mention the same real-world entity with
+    different roles in different events: ``Sơn Tinh`` is the *agent* of
+    ``Sơn Tinh gặp gỡ`` (type ``Person``) and the *theme* of ``Mị Nương
+    cưới Sơn Tinh`` (type ``Entity``).  With the type in the key the two
+    mentions became **two different nodes** (1 056 names, 2 819 nodes and
+    12 914 relations were affected), so the graph traversal that starts at
+    the anchor of a template question could not reach the gold event: the
+    question "Ai là người cưới Sơn Tinh?" linked the *Person* node while
+    the answer sat behind the *Entity* node, and the answerer refused
+    (measured: 42 % of the VHE template questions were refused).
+
+    With a type-independent uid the two mentions collapse into one node and
+    the event hub (``theme <-[ABOUT]- event <-[PARTICIPATED_IN]- agent``)
+    connects the whole chain.  The coarse type is still stored on the node
+    (it is merged afterwards), it just does not split the identity.
+
+    >>> vhe_entity_uid("Sơn Tinh", "Person") == vhe_entity_uid("Sơn Tinh", "Entity")
+    True
+    """
+    return stable_uid(name_key(mention) or mention, prefix="vhe_ent_")
 
 
 def _arg_type(role: str, mention: str) -> str:
@@ -234,6 +257,7 @@ def import_vhe_gold(
                             extra={
                                 "mention": mention,
                                 "roles": [role],
+                                "entity_types": [entity_type],
                                 "resolution": "vhe_gold",
                             },
                         )
@@ -245,6 +269,14 @@ def import_vhe_gold(
                         if role not in roles:
                             roles.append(role)
                             existing.extra["roles"] = roles
+                        # The same mention can be typed differently in two
+                        # events (see :func:`vhe_entity_uid`).  The node keeps
+                        # every observed type so that the retrieval layer can
+                        # still use it as a hint.
+                        types = list(existing.extra.get("entity_types") or [])
+                        if entity_type not in types:
+                            types.append(entity_type)
+                            existing.extra["entity_types"] = types
 
                     rel_type = relation_for_role(role, ontology.relation_types)
                     if edge_is_participant_to_event(rel_type):
