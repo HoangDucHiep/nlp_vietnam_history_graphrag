@@ -121,7 +121,16 @@ def main(argv: list[str] | None = None) -> int:
             url=str(cfg.get("url", "http://localhost:6333")),
             vector_size=int(cfg.get("vector_size", 768)),
         )
-        return {"chunks": vs.count(str(cfg.get("collection_chunks", "chunks")))}
+        # The collection depends on the *active* embedder: the Gemini vectors
+        # are 768-dim, the local sentence-transformers model is 384-dim.
+        embedder = build_embedder(settings, llm_client)
+        is_local = str(getattr(embedder, "name", "")).startswith("local:")
+        collection = str(
+            cfg.get("collection_chunks_local", "chunks_local")
+            if is_local
+            else cfg.get("collection_chunks", "chunks")
+        )
+        return {"collection": collection, "chunks": vs.count(collection)}
 
     report["checks"].append(check("qdrant", _qdrant_check))
 
@@ -161,6 +170,27 @@ def main(argv: list[str] | None = None) -> int:
                 reranker=build_reranker(settings, embedder),
                 settings=settings,
             )
+            # The chunk collection must match the dimension of the *active*
+            # embedder: the Gemini vectors are 768-dim, the local
+            # sentence-transformers model is 384-dim.  Searching the wrong
+            # collection fails with "Wrong input: Vector dimension error" and
+            # the pipeline silently falls back to zero evidence.
+            is_local = str(getattr(embedder, "name", "")).startswith("local:")
+            collection = str(
+                qcfg.get("collection_chunks_local", "chunks_local")
+                if is_local
+                else qcfg.get("collection_chunks", "chunks")
+            )
+            vhe_collection = str(
+                qcfg.get(
+                    "collection_chunks_vhe_local" if is_local else "collection_chunks_vhe",
+                    "chunks_vhe_local" if is_local else "chunks_vhe",
+                )
+            )
+            collections = [collection]
+            if vhe_collection != collection:
+                collections.append(vhe_collection)
+            pipeline.set_chunk_collections(collections)
             result = pipeline.ask(args.question)
             return {
                 "question": result.question,
@@ -169,6 +199,7 @@ def main(argv: list[str] | None = None) -> int:
                 "refused": result.refused,
                 "n_evidence": len(result.evidence),
                 "n_linked": len(result.explanation.get("linked_entities") or []),
+                "collections": collections,
                 "elapsed": round(result.elapsed, 2),
             }
 
